@@ -56,6 +56,13 @@ Type number 22002 of the module and the BaseUnit) - without touching the symbol
 or its other texts. live_place_function_property writes the Location relative
 to the symbol's insertion point (EPLAN 2.9; v8 wrote page mm -> off the sheet).
 
+v10 (inbox 2026-11-03_eplan_besedilo_poti_pathtext_branje_urejanje.md):
+live_set_texts changes the contents of Text / PathText (path function text -
+it feeds FUNC_TEXT_AUTOMATIC of the functions of its path) and reports which
+functions changed; live_read_page(include_text_content=True) reads them.
+live_set_function_properties(items=[...]) writes different values to many
+functions in one call (inbox 2026-11-03_eplan_set_function_properties_brez_paketa.md).
+
 API names used on EPLAN 2.9 (eplan.help API 2.9):
     FunctionPropertyList.FUNC_PLCADDRESS                     #20400
     FunctionPropertyList.FUNC_PLCCHANNEL_DESIGNATION_MANUAL  #20407
@@ -85,6 +92,7 @@ __all__ = [
     "live_place_function_property",
     "live_add_function_articles",
     "live_hide_function_property",
+    "live_set_texts",
 ]
 
 
@@ -917,7 +925,10 @@ def live_set_function_properties(values: dict = None, name: str = None, handle: 
                                  timeout_seconds: float = 120.0,
                                  replace_article_mode: str = "auto",
                                  allow_unverified_db: bool = False,
-                                 allow_missing_article: bool = False) -> dict:
+                                 allow_missing_article: bool = False,
+                                 items: list = None, dry_run: bool = False,
+                                 rollback_on_error: bool = True, verbose: bool = False,
+                                 max_items: int = 500) -> dict:
     """
     Set FunctionPropertyList values of functions in the open project. WRITES -
     scratch-only unless allow_real_project=True.
@@ -959,6 +970,31 @@ def live_set_function_properties(values: dict = None, name: str = None, handle: 
             found -> errorType ARTICLE_NOT_IN_DB, nothing written (EPLAN would
             write a reference without description / manufacturer). True writes
             it anyway. "articleInDb" reports the lookup (null = undecided).
+        items: v10 - MANY functions, each its own values, in ONE call (one
+            script, one LockingStep): [{"handle": "...", "values": {...}} or
+            {"name": "=AB-C+DI-510K3", "connection_designation": "9",
+            "page"?: "...", "values": {"FUNC_SUPPLEMENTARYFIELD[1]": "Skid"},
+            "limit"?: 2}] (up to max_items, default 500; limit = functions one
+            item may match, default 1 - a PLC point on the schematic AND on the
+            card overview has the same name: limit 2). Not with values / name /
+            handle / page / connection_designation / replace_article. Every
+            item is resolved and every property checked BEFORE the first write
+            (an item without / with too many functions, two items on one
+            function, an undeclared property -> nothing written). A value
+            already equal (also the MultiLangString form "??_??@x;" of x) is
+            not written ("unchanged"). COMPACT answer: "counts" {items,
+            functions, written / wouldWrite, unchanged, verified, unverified},
+            "unverified" [{item, handle, name, property, requested, new}]
+            (up to 50), "failedAt"; verbose=True adds "details" per function
+            (previous, requested, new, route).
+        dry_run: v10, default False (as before). True: nothing written -
+            items (or the single selector + values as one item) are resolved
+            and counted ("wouldWrite" / "unchanged"); no scratch guard needed.
+        rollback_on_error: v10, items only (default True): an error during the
+            writes restores the previous value of every write of this call
+            (errorType ROLLED_BACK; False -> PARTIAL).
+        verbose: v10, items only - "details" per function.
+        max_items: v10, items only (default 500).
 
     Returns:
         {"success", "project", "matched", "modified", "details": [{"name",
@@ -968,7 +1004,28 @@ def live_set_function_properties(values: dict = None, name: str = None, handle: 
         reversible. A failure mid-way keeps "details" of what was already
         written. EPLAN stores the change in the project database itself (no
         save command; get_current_project reports "databaseLastWrite").
+        v10 items / dry_run: {"success", "dryRun", "matchedFunctions",
+        "counts", "unverified", "warning"} (see items).
     """
+    if items is not None:
+        given = [k for k, v in (("values", values), ("name", name), ("handle", handle), ("page", page),
+                                ("connection_designation", connection_designation),
+                                ("replace_article", replace_article)) if v is not None]
+        if given:
+            return _err(SchematicValueError(
+                "items=[...] carries selector and values per item - do not pass %s with it." % ", ".join(given)))
+        return _set_function_properties_items(items, allow_real_project, timeout_seconds, dry_run,
+                                               rollback_on_error, verbose, max_items)
+    if dry_run:
+        # v10: dry run of the single selector = one item
+        if replace_article is not None:
+            return _err(SchematicValueError("dry_run is not available with replace_article."))
+        if not handle and not name:
+            return _err(SchematicValueError("Give handle, or name (+ connection_designation / page)."))
+        return _set_function_properties_items(
+            [{"handle": handle, "name": name, "page": page, "connection_designation": connection_designation,
+              "values": values or {}, "limit": limit}],
+            allow_real_project, timeout_seconds, True, rollback_on_error, verbose, max_items)
     try:
         if not handle and not name:
             raise SchematicValueError("Give handle, or name (+ connection_designation / page).")
@@ -3896,4 +3953,1250 @@ def live_hide_function_property(property_id=None, handles: list = None, handle: 
             fa.get("handle"), fa.get("step"), fa.get("error"),
             "All changes of this call were undone." if rollback_on_error and not out.get("rollbackErrors")
             and not out.get("notRestorable") else "Some changes stay - check the page."))
+    return out
+
+
+# ---------------------------------------------------------------------------
+# v10  texts on the sheet (Text / PathText) and batch property writes
+# ---------------------------------------------------------------------------
+# inbox 2026-11-03_eplan_besedilo_poti_pathtext_branje_urejanje.md :
+# the path function text (PathText, magenta under every device) feeds
+# FUNC_TEXT_AUTOMATIC (#20031) of the functions of its path whose FUNC_TEXT is
+# empty - and so the ET 200SP cards. live_read_page(include_text_content=True)
+# reads it, live_set_texts changes it. inbox 2026-11-03_eplan_set_function_
+# properties_brez_paketa.md / 2026-11-02_..._paketno.md: live_set_function_
+# properties(items=[...]) writes different values to many functions in ONE call.
+#
+# API 2.9 (eplan.help): Graphics.PathText : Text : TextBase : GraphicalPlacement;
+# Text.Contents (MultiLangString get/set - invalid on a PropertyPlacement);
+# TextBase.GetDisplayString / Height / Justification / TextColorId (-16002 =
+# from layer) / Rotation / LanguageMode / FixedLanguage; GraphicalPlacement.Layer
+# (GraphicalLayer); MultiLangString() / GetAsString / SetAsString /
+# AddString(ISOCode.Language, string) / DeleteString(ISOCode.Language);
+# ISOCode.Language L___ (0, language independent "??_??"), L_sl_SI, L_en_US ...;
+# FunctionPropertyList.FUNC_TEXT_AUTOMATIC #20031 read-only: "the manually
+# entered function text or, if it is empty, the path function text" - EPLAN
+# evaluates it, there is no setter and no action to refresh it.
+
+_HELPERS_V10 = r'''
+    // ---- v10: Text / PathText contents -------------------------------------
+    static Dictionary<Type, int> _txKind = new Dictionary<Type, int>();
+
+    // 0 = no text, 1 = Text, 2 = PathText. A PropertyPlacement (a TextBase, not
+    // a Text: setting its Contents is invalid) is never taken.
+    static int TxKind(object o)
+    {
+        if (o == null) return 0;
+        Type t0 = o.GetType();
+        int k;
+        if (_txKind.TryGetValue(t0, out k)) return k;
+        k = 0;
+        bool path = false;
+        Type t = t0;
+        while (t != null)
+        {
+            if (t.Name == "PropertyPlacement") { k = 0; break; }
+            if (t.Name == "PathText") path = true;
+            if (t.Name == "Text" && (t.Namespace == null || t.Namespace.EndsWith(".Graphics"))) { k = path ? 2 : 1; break; }
+            t = t.BaseType;
+        }
+        _txKind[t0] = k;
+        return k;
+    }
+
+    static IEnumerable AllPagesOf(object project)
+    {
+        Type finderType = FindType("Eplan.EplApi.DataModel.DMObjectsFinder");
+        object finder = Activator.CreateInstance(finderType, new object[] { project });
+        Type filterType = FindType("Eplan.EplApi.DataModel.PagesFilter");
+        object filter = Activator.CreateInstance(filterType);
+        MethodInfo getPages = RequireMethod(finderType, "GetPages", new string[] { filterType.Name }, false);
+        object r = Call(getPages, finder, new object[] { filter });
+        if (r == null) throw new Exception("GetPages returned null.");
+        return (IEnumerable)r;
+    }
+
+    // MultiLangString in EPLAN's string form "sl_SI@text;en_US@text;" ("??_??" = language independent).
+    static string MlsRaw(object mls)
+    {
+        if (mls == null) return "";
+        MethodInfo ga = MethodByShape(mls.GetType(), "GetAsString", new string[] { }, false);
+        if (ga != null)
+        {
+            try { object s = ga.Invoke(mls, null); if (s != null) return s.ToString(); }
+            catch { }
+        }
+        string t = SafeText(mls);
+        return t == null ? "" : t;
+    }
+
+    // {language, text} segments; null = not in the MultiLangString form (plain text).
+    static List<string[]> MlsSegs(string raw)
+    {
+        List<string[]> segs = new List<string[]>();
+        if (raw == null || raw.Length == 0) return segs;
+        int i = 0;
+        while (i < raw.Length)
+        {
+            if (i + 6 > raw.Length || raw[i + 2] != '_' || raw[i + 5] != '@') return null;
+            for (int k = 0; k < 5; k++)
+            {
+                if (k == 2) continue;
+                char c = raw[i + k];
+                if (!(c == '?' || char.IsLetter(c))) return null;
+            }
+            int end = raw.IndexOf(';', i + 6);
+            if (end < 0) end = raw.Length;
+            string[] g = new string[2];
+            g[0] = raw.Substring(i, 5);
+            g[1] = raw.Substring(i + 6, end - i - 6);
+            segs.Add(g);
+            i = end + 1;
+        }
+        return segs;
+    }
+
+    // the text of one language; null = no entry (plain text counts as "??_??")
+    static string MlsEntry(string raw, string lang)
+    {
+        List<string[]> s = MlsSegs(raw);
+        if (s == null) return lang == "??_??" ? raw : null;
+        foreach (string[] g in s) if (g[0] == lang) return g[1];
+        return null;
+    }
+
+    static bool MlsEntryAny(string raw, string want)
+    {
+        List<string[]> s = MlsSegs(raw);
+        if (s == null) return false;
+        foreach (string[] g in s) if (g[1] == want) return true;
+        return false;
+    }
+
+    // whitespace removed: FUNC_TEXT_AUTOMATIC drops line breaks when displayed
+    static string MlsNorm(string s)
+    {
+        if (s == null) return "";
+        StringBuilder b = new StringBuilder();
+        foreach (char c in s) if (!char.IsWhiteSpace(c)) b.Append(c);
+        return b.ToString();
+    }
+
+    static List<string> MlsTexts(string raw)
+    {
+        List<string> l = new List<string>();
+        if (raw == null || raw.Length == 0) return l;
+        List<string[]> s = MlsSegs(raw);
+        if (s == null) { string n0 = MlsNorm(raw); if (n0.Length > 0) l.Add(n0); return l; }
+        foreach (string[] g in s)
+        {
+            string n = MlsNorm(g[1]);
+            if (n.Length > 0 && !l.Contains(n)) l.Add(n);
+        }
+        return l;
+    }
+
+    static bool MlsShares(string a, string b)
+    {
+        List<string> lb = MlsTexts(b);
+        foreach (string x in MlsTexts(a)) if (lb.Contains(x)) return true;
+        return false;
+    }
+
+    // same text in every language (order and a trailing ';' aside)
+    static bool MlsSame(string a, string b)
+    {
+        List<string[]> sa = MlsSegs(a);
+        List<string[]> sb2 = MlsSegs(b);
+        if (sa == null || sb2 == null) return a == b;
+        Dictionary<string, string> da = new Dictionary<string, string>();
+        foreach (string[] g in sa) da[g[0]] = g[1];
+        Dictionary<string, string> db = new Dictionary<string, string>();
+        foreach (string[] g in sb2) db[g[0]] = g[1];
+        if (da.Count != db.Count) return false;
+        foreach (KeyValuePair<string, string> kv in da)
+        {
+            string v;
+            if (!db.TryGetValue(kv.Key, out v) || v != kv.Value) return false;
+        }
+        return true;
+    }
+
+    static object LangEnum(Type langType, string code)
+    {
+        string n = code == "??_??" ? "L___" : "L_" + code;
+        try { return Enum.Parse(langType, n); }
+        catch
+        {
+            throw new Exception("language '" + code + "' is not a " + langType.FullName + " value (" + n + ").");
+        }
+    }
+
+    // The new contents as a FRESH MultiLangString (the type of Text.Contents):
+    // mode "raw" = text is a whole MultiLangString; else the entry of `lang` is set,
+    // the other languages kept (keep) or dropped.
+    static object MlsBuild(Type mlsType, string oldRaw, string mode, string lang, bool keep, string text, out string route)
+    {
+        object m = Activator.CreateInstance(mlsType);
+        MethodInfo setAs = RequireMethod(mlsType, "SetAsString", new string[] { "String" }, false);
+        if (mode == "raw")
+        {
+            Call(setAs, m, new object[] { text });
+            route = "MultiLangString.SetAsString(raw)";
+            return m;
+        }
+        route = "";
+        if (keep && oldRaw.Length > 0) { Call(setAs, m, new object[] { oldRaw }); route = "SetAsString(old)+"; }
+        MethodInfo add = RequireMethod(mlsType, "AddString", new string[] { "Language", "String" }, false);
+        Type lt = add.GetParameters()[0].ParameterType;
+        object lv = LangEnum(lt, lang);
+        MethodInfo del = MethodByShape(mlsType, "DeleteString", new string[] { "Language" }, false);
+        if (del != null && route.Length > 0)
+        {
+            try { del.Invoke(m, new object[] { lv }); route += "DeleteString+"; } catch { }
+        }
+        Call(add, m, new object[] { lv, text });
+        route += "AddString(" + lt.Name + "." + lv + ")";
+        return m;
+    }
+
+    static string TxDisplayed(object t)
+    {
+        MethodInfo gd = MethodByShape(t.GetType(), "GetDisplayString", new string[] { }, false);
+        if (gd == null) return null;
+        try { object s = gd.Invoke(t, null); return s == null ? null : SafeText(s); }
+        catch { return null; }
+    }
+
+    static string TxLayer(object t)
+    {
+        object ly = TryRead(t, "Layer", null);
+        if (ly == null) return null;
+        string n = SafeText(TryRead(ly, "Name", null));
+        return n != null && n.Length > 0 ? n : SafeText(ly);
+    }
+
+    static double TxNum(object t, string name, double dflt)
+    {
+        object v = TryRead(t, name, null);
+        if (v == null) return dflt;
+        try { return Convert.ToDouble(v); } catch { return dflt; }
+    }
+
+    // what a contents change must leave alone (height only when not requested)
+    static string TxGeom(object t, bool withHeight)
+    {
+        double[] xy = PlXY(t);
+        string s = xy == null ? "-" : Math.Round(xy[0], 3) + "/" + Math.Round(xy[1], 3);
+        if (withHeight) s += " h" + Math.Round(TxNum(t, "Height", -1), 3);
+        s += " j" + SafeText(TryRead(t, "Justification", null)) + " l" + TxLayer(t) +
+             " c" + SafeText(TryRead(t, "TextColorId", null)) + " v" + SafeText(TryRead(t, "IsSetAsVisible", null)) +
+             " r" + SafeText(TryRead(t, "Rotation", null));
+        return s;
+    }
+
+    static Dictionary<string, object> TxRecord(object t)
+    {
+        Dictionary<string, object> d = new Dictionary<string, object>();
+        d["kind"] = TxKind(t) == 2 ? "PathText" : "Text";
+        d["raw"] = MlsRaw(TryRead(t, "Contents", null));
+        string disp = TxDisplayed(t);
+        if (disp != null) d["displayed"] = disp;
+        object loc = TryRead(t, "Location", null);
+        if (loc != null) { try { d["location"] = PtDict(loc); } catch { } }
+        double h = TxNum(t, "Height", -1);
+        if (h >= 0) d["height"] = Math.Round(h, 4);
+        object j = TryRead(t, "Justification", null);
+        if (j != null) d["justification"] = SafeText(j);
+        string ly = TxLayer(t);
+        if (ly != null) d["layer"] = ly;
+        object c = TryRead(t, "TextColorId", null);
+        if (c != null) { try { d["textColorId"] = Convert.ToInt32(c); } catch { } }
+        object v = TryRead(t, "IsSetAsVisible", null);
+        if (v != null) d["setAsVisible"] = SafeText(v);
+        object r = TryRead(t, "Rotation", null);
+        if (r != null) { try { d["rotation"] = Math.Round(Convert.ToDouble(r), 4); } catch { } }
+        object lm = TryRead(t, "LanguageMode", null);
+        if (lm != null) d["languageMode"] = SafeText(lm);
+        object fl = TryRead(t, "FixedLanguage", null);
+        if (fl != null) d["fixedLanguage"] = SafeText(fl);
+        return d;
+    }
+
+    // ---- v10: functions that show a path function text -----------------------
+    static string FnTextProp(object fn, string name)
+    {
+        try
+        {
+            string t;
+            if (ReadFnProp(FnProps(fn), name, 0, out t) && t != null && !t.StartsWith("<error")) return t;
+        }
+        catch { }
+        return "";
+    }
+
+    // {fn, handle, name, page, x (NaN = none), FUNC_TEXT, FUNC_TEXT_AUTOMATIC}
+    static object[] FnTextRow(object fn, string h)
+    {
+        double[] xy = PlXY(fn);
+        object[] r = new object[7];
+        r[0] = fn;
+        r[1] = h;
+        r[2] = SafeText(TryRead(fn, "Name", null));
+        r[3] = FnPageName(fn);
+        r[4] = xy == null ? double.NaN : xy[0];
+        r[5] = FnTextProp(fn, "FUNC_TEXT");
+        r[6] = FnTextProp(fn, "FUNC_TEXT_AUTOMATIC");
+        return r;
+    }
+
+    // the functions on these pages (pages null = every function of the project)
+    static List<object[]> FnTextRows(object project, List<object> pages)
+    {
+        List<object[]> rows = new List<object[]>();
+        Dictionary<string, bool> seen = new Dictionary<string, bool>();
+        if (pages == null)
+        {
+            foreach (object fn in AllFunctions(project))
+            {
+                if (fn == null) continue;
+                string h = Handle(fn);
+                if (h == null || seen.ContainsKey(h)) continue;
+                seen[h] = true;
+                rows.Add(FnTextRow(fn, h));
+            }
+            return rows;
+        }
+        foreach (object pg in pages)
+            foreach (object pl in PagePlacements(pg))
+            {
+                if (pl == null || !IsFunctionType(pl)) continue;
+                string h = Handle(pl);
+                if (h == null || seen.ContainsKey(h)) continue;
+                seen[h] = true;
+                rows.Add(FnTextRow(pl, h));
+            }
+        return rows;
+    }
+
+    static double FnDist(object[] r, string pageName, double x)
+    {
+        if ((string)r[3] != pageName || double.IsNaN((double)r[4]) || double.IsNaN(x)) return 1e9;
+        return Math.Abs((double)r[4] - x);
+    }
+
+    // functions with an EMPTY FUNC_TEXT whose FUNC_TEXT_AUTOMATIC shows `raw`, nearest first
+    // (the same text under other paths matches too - "dx" tells them apart)
+    static List<object> FnShowing(List<object[]> rows, string raw, string pageName, double x, int max, out int total)
+    {
+        List<object[]> hits = new List<object[]>();
+        foreach (object[] r in rows)
+        {
+            if (MlsTexts((string)r[5]).Count > 0) continue;   // its own function text wins
+            if (!MlsShares((string)r[6], raw)) continue;
+            hits.Add(r);
+        }
+        total = hits.Count;
+        hits.Sort(delegate(object[] a, object[] b) { return FnDist(a, pageName, x).CompareTo(FnDist(b, pageName, x)); });
+        List<object> list = new List<object>();
+        foreach (object[] r in hits)
+        {
+            if (list.Count >= max) break;
+            Dictionary<string, object> d = new Dictionary<string, object>();
+            d["handle"] = r[1];
+            d["name"] = r[2];
+            if ((string)r[3] != pageName) d["page"] = r[3];
+            else if (!double.IsNaN((double)r[4]) && !double.IsNaN(x)) d["dx"] = Math.Round((double)r[4] - x, 2);
+            list.Add(d);
+        }
+        return list;
+    }
+
+    // ---- v10: batch property writes (live_set_function_properties items) -----
+    static string FnWrite(object fn, string name, int idx, string val)
+    {
+        object props = FnProps(fn);
+        if (idx > 0)
+        {
+            PropertyInfo ipi = GetPropInfoIdx(props.GetType(), name);
+            object pv = ipi.GetValue(props, new object[] { idx });
+            Call(RequireMethod(pv.GetType(), "Set", new string[] { "String" }, false), pv, new object[] { val });
+            return "indexed getter+Set(string)";
+        }
+        return SetLiveProp(props, name, val);
+    }
+
+    // previous value back; a MultiLangString form ("??_??@x;") through Set(MultiLangString)
+    static string FnRestore(object fn, string name, int idx, string prev)
+    {
+        List<string[]> segs = MlsSegs(prev);
+        if (segs != null && segs.Count > 0)
+        {
+            object props = FnProps(fn);
+            PropertyInfo pi = idx > 0 ? GetPropInfoIdx(props.GetType(), name) : GetPropInfo(props.GetType(), name);
+            object pv = pi == null ? null : (idx > 0 ? pi.GetValue(props, new object[] { idx }) : pi.GetValue(props, null));
+            MethodInfo setM = pv == null ? null : MethodByShape(pv.GetType(), "Set", new string[] { "MultiLangString" }, false);
+            if (setM != null)
+            {
+                Type mt = setM.GetParameters()[0].ParameterType;
+                object m = Activator.CreateInstance(mt);
+                Call(RequireMethod(mt, "SetAsString", new string[] { "String" }, false), m, new object[] { prev });
+                Call(setM, pv, new object[] { m });
+                return "Set(MultiLangString)";
+            }
+        }
+        return FnWrite(fn, name, idx, prev);
+    }
+'''
+
+
+# live_read_page(include_text_content=True): appended to the read body.
+_READ_TEXT_BODY = r'''
+            Dictionary<string, Dictionary<string, object>> v10byH = new Dictionary<string, Dictionary<string, object>>();
+            foreach (object v10o in (List<object>)state["placements"])
+            {
+                Dictionary<string, object> v10d = v10o as Dictionary<string, object>;
+                if (v10d == null || !v10d.ContainsKey("handle") || v10d["handle"] == null) continue;
+                string v10k = v10d["handle"].ToString();
+                if (!v10byH.ContainsKey(v10k)) v10byH[v10k] = v10d;
+            }
+            int v10n = 0;
+            List<object[]> v10paths = new List<object[]>();
+            foreach (object pl in PagePlacements(page))
+            {
+                if (pl == null || TxKind(pl) == 0) continue;
+                string h = Handle(pl);
+                if (h == null || !v10byH.ContainsKey(h)) continue;
+                Dictionary<string, object> rec;
+                try { rec = TxRecord(pl); }
+                catch (Exception ex) { rec = new Dictionary<string, object>(); rec["error"] = Flatten(ex); }
+                v10byH[h]["textContent"] = rec;
+                v10n++;
+                if (TxKind(pl) == 2) v10paths.Add(new object[] { pl, rec });
+            }
+            results["textContentCount"] = v10n;
+            results["pathTextCount"] = v10paths.Count;
+            int v10fmax = V10FMAX;
+            if (v10fmax > 0 && v10paths.Count > 0)
+            {
+                List<object> v10pages = new List<object>();
+                v10pages.Add(page);
+                List<object[]> v10rows = FnTextRows(project, v10pages);
+                string v10pn = PropText(page, "Name");
+                foreach (object[] v10pt in v10paths)
+                {
+                    Dictionary<string, object> v10rec = (Dictionary<string, object>)v10pt[1];
+                    if (!v10rec.ContainsKey("raw")) continue;
+                    double[] v10xy = PlXY(v10pt[0]);
+                    int v10tot;
+                    v10rec["functionsShowingIt"] = FnShowing(v10rows, (string)v10rec["raw"], v10pn,
+                        v10xy == null ? double.NaN : v10xy[0], v10fmax, out v10tot);
+                    v10rec["functionsShowingItCount"] = v10tot;
+                }
+                results["pageFunctionsChecked"] = v10rows.Count;
+            }
+'''
+
+
+def _cs_lit(value):
+    """v10: a C# string literal; non-ASCII as \\uXXXX (en dash, č ...) - no codepage involved."""
+    out = []
+    for ch in cs_escape(value):
+        cp = ord(ch)
+        if cp < 0x80:
+            out.append(ch)
+        elif cp <= 0xFFFF:
+            out.append("\\u%04x" % cp)
+        else:
+            cp -= 0x10000
+            out.append("\\u%04x\\u%04x" % (0xD800 + (cp >> 10), 0xDC00 + (cp & 0x3FF)))
+    return '"%s"' % "".join(out)
+
+
+def _cs_lit_array(values):
+    return "new string[] { " + ", ".join(_cs_lit(v) for v in values) + " }"
+
+
+def _cs_double_array(values):
+    return "new double[] { " + ", ".join(cs_double(v, "value") for v in values) + " }"
+
+
+def _text_display(raw):
+    """display text of a MultiLangString form (first non-empty language), else raw itself."""
+    disp, by_lang = multilang_display(raw)
+    return (raw if disp is None else disp), by_lang
+
+
+# ---------------------------------------------------------------------------
+# v10  live_set_texts
+# ---------------------------------------------------------------------------
+
+_SET_TEXTS_BODY = r'''
+            string[] tH = V10H;
+            string[] tT = V10T;
+            string[] tL = V10L;
+            string[] tP = V10P;
+            bool[] tK = V10K;
+            double[] tHt = V10HT;
+            bool tDry = V10DRY;
+            bool tRb = V10RB;
+            string tFn = V10FN;
+            int tFmax = V10FMAX;
+            int tChMax = V10CHMAX;
+            bool tVerbose = V10VERB;
+
+            // ---- 1. resolve every handle BEFORE anything is written ---------------
+            Dictionary<string, bool> wanted = new Dictionary<string, bool>();
+            foreach (string h in tH) wanted[h] = true;
+            Dictionary<string, object> byH = new Dictionary<string, object>();
+            Dictionary<string, object> pgOf = new Dictionary<string, object>();
+            List<string> pnames = new List<string>();
+            foreach (string p in tP) if (p.Length > 0 && !pnames.Contains(p)) pnames.Add(p);
+            foreach (string pn in pnames)
+            {
+                object pg = FindPage(project, pn);
+                foreach (object pl in PagePlacements(pg))
+                {
+                    if (pl == null || TxKind(pl) == 0) continue;
+                    string h0 = Handle(pl);
+                    if (h0 != null && wanted.ContainsKey(h0) && !byH.ContainsKey(h0)) { byH[h0] = pl; pgOf[h0] = pg; }
+                }
+            }
+            if (byH.Count < wanted.Count)
+            {
+                foreach (object pg in AllPagesOf(project))
+                {
+                    if (pg == null) continue;
+                    foreach (object pl in PagePlacements(pg))
+                    {
+                        if (pl == null || TxKind(pl) == 0) continue;
+                        string h0 = Handle(pl);
+                        if (h0 != null && wanted.ContainsKey(h0) && !byH.ContainsKey(h0)) { byH[h0] = pl; pgOf[h0] = pg; }
+                    }
+                    if (byH.Count == wanted.Count) break;
+                }
+            }
+            List<string> missing = new List<string>();
+            foreach (string h in tH) if (!byH.ContainsKey(h) && !missing.Contains(h)) missing.Add(h);
+            if (missing.Count > 0)
+                throw new Exception("Nothing changed: " + missing.Count + " handle(s) are no Text / PathText of this project: " +
+                    string.Join(", ", missing.ToArray()) + ". Handles are session-scoped - re-read them with " +
+                    "live_read_page(types=[Text, PathText], include_text_content=true). Symbols and property texts are refused.");
+
+            // ---- 2. plan: the new contents of every text, checked BEFORE the first write
+            List<string> problems = new List<string>();
+            List<object> items = new List<object>();
+            List<object[]> plan = new List<object[]>();   // {i, text, old raw, new MLS, Contents property, height requested, unchanged}
+            for (int i = 0; i < tH.Length; i++)
+            {
+                object t = byH[tH[i]];
+                Dictionary<string, object> it = new Dictionary<string, object>();
+                it["i"] = i;
+                it["handle"] = tH[i];
+                it["kind"] = TxKind(t) == 2 ? "PathText" : "Text";
+                it["page"] = PropText(pgOf[tH[i]], "Name");
+                items.Add(it);
+                if (tP[i].Length > 0 && (string)it["page"] != tP[i])
+                {
+                    problems.Add("item " + i + ": " + tH[i] + " is on page '" + it["page"] + "', not '" + tP[i] + "'");
+                    continue;
+                }
+                PropertyInfo cp = GetWritable(t.GetType(), "Contents");
+                if (cp == null)
+                {
+                    problems.Add("item " + i + ": " + t.GetType().Name + " has no writable Contents. " + MemberList(t.GetType(), false));
+                    continue;
+                }
+                string oldRaw = MlsRaw(TryRead(t, "Contents", null));
+                it["before"] = oldRaw;
+                string disp0 = TxDisplayed(t);
+                if (disp0 != null) it["displayedBefore"] = disp0;
+                string lang = tL[i];
+                if (lang == "auto")
+                {
+                    List<string[]> segs = MlsSegs(oldRaw);
+                    List<string> langs = new List<string>();
+                    if (segs != null) foreach (string[] g in segs) if (g[1].Length > 0 && !langs.Contains(g[0])) langs.Add(g[0]);
+                    if (langs.Count == 0) lang = "??_??";
+                    else if (langs.Count == 1) lang = langs[0];
+                    else
+                    {
+                        it["languages"] = langs;
+                        problems.Add("item " + i + ": the text has " + langs.Count + " languages (" + string.Join(", ", langs.ToArray()) +
+                            ") - give language = one of them, ??_?? or raw");
+                        continue;
+                    }
+                }
+                it["language"] = lang;
+                string route;
+                object newM;
+                try { newM = MlsBuild(cp.PropertyType, oldRaw, lang == "raw" ? "raw" : "lang", lang, tK[i], tT[i], out route); }
+                catch (Exception ex) { problems.Add("item " + i + ": " + Flatten(ex)); continue; }
+                string newRaw = MlsRaw(newM);
+                it["after"] = newRaw;
+                it["route"] = route;
+                bool okPred = lang == "raw" ? MlsSame(newRaw, tT[i]) : MlsEntry(newRaw, lang) == tT[i];
+                if (!okPred)
+                {
+                    problems.Add("item " + i + ": the new contents '" + newRaw + "' would not hold the requested text in " + lang);
+                    continue;
+                }
+                bool hReq = tHt[i] > 0;
+                if (hReq) it["heightRequested"] = tHt[i];
+                bool same = MlsSame(newRaw, oldRaw) && (!hReq || Math.Abs(TxNum(t, "Height", -1) - tHt[i]) < 0.0005);
+                it["action"] = same ? "unchanged" : "change";
+                if (tVerbose) it["record"] = TxRecord(t);
+                plan.Add(new object[] { i, t, oldRaw, newM, cp, hReq, same });
+            }
+            results["items"] = items;
+            results["dryRun"] = tDry;
+            if (problems.Count > 0)
+                throw new Exception("Nothing changed: " + string.Join("; ", problems.GetRange(0, Math.Min(20, problems.Count)).ToArray()) +
+                    (problems.Count > 20 ? " (+" + (problems.Count - 20) + " more)" : ""));
+
+            // ---- 3. functions of the path texts (FUNC_TEXT_AUTOMATIC) before the write
+            bool anyPath = false;
+            foreach (object[] p in plan) if (TxKind(p[1]) == 2 && !(bool)p[6]) anyPath = true;
+            List<object[]> rows = null;
+            if (tFn != "none" && anyPath)
+            {
+                List<object> pgs = null;
+                if (tFn == "page")
+                {
+                    pgs = new List<object>();
+                    foreach (object[] p in plan)
+                    {
+                        if (TxKind(p[1]) != 2) continue;
+                        object pg = pgOf[tH[(int)p[0]]];
+                        if (!pgs.Contains(pg)) pgs.Add(pg);
+                    }
+                }
+                rows = FnTextRows(project, pgs);
+                results["functionsChecked"] = rows.Count;
+                results["functionsScope"] = tFn;
+                foreach (object[] p in plan)
+                {
+                    if (TxKind(p[1]) != 2 || (bool)p[6]) continue;
+                    Dictionary<string, object> it = (Dictionary<string, object>)items[(int)p[0]];
+                    double[] txy = PlXY(p[1]);
+                    int tot;
+                    List<object> sh = FnShowing(rows, (string)p[2], (string)it["page"], txy == null ? double.NaN : txy[0], tFmax, out tot);
+                    it["functionsShowingOldCount"] = tot;
+                    if (sh.Count > 0) it["functionsShowingOld"] = sh;
+                }
+            }
+
+            // ---- 4. write, read back, undo everything of this call on an error ----
+            if (!tDry)
+            {
+                List<object[]> undo = new List<object[]>();   // {text, Contents property, old raw, old height} - height back too if it moved
+                Dictionary<string, object> failedAt = null;
+                foreach (object[] p in plan)
+                {
+                    int i = (int)p[0];
+                    object t = p[1];
+                    Dictionary<string, object> it = (Dictionary<string, object>)items[i];
+                    if ((bool)p[6]) { it["result"] = "unchanged"; continue; }
+                    bool hReq = (bool)p[5];
+                    string step = "Contents";
+                    try
+                    {
+                        string geom0 = TxGeom(t, !hReq);
+                        undo.Add(new object[] { t, p[4], p[2], TxNum(t, "Height", -1), i });
+                        PropertyInfo cp = (PropertyInfo)p[4];
+                        try { cp.SetValue(t, p[3], null); }
+                        catch (TargetInvocationException tie) { throw new Exception("Contents: " + Flatten(tie.InnerException)); }
+                        if (hReq)
+                        {
+                            step = "Height";
+                            PropertyInfo hp = RequireWritable(t.GetType(), "Height");
+                            try { hp.SetValue(t, tHt[i], null); }
+                            catch (TargetInvocationException tie) { throw new Exception("Height: " + Flatten(tie.InnerException)); }
+                        }
+                        step = "verify";
+                        string got = MlsRaw(TryRead(t, "Contents", null));
+                        it["after"] = got;
+                        string lang = (string)it["language"];
+                        bool ok = lang == "raw" ? MlsSame(got, tT[i]) : MlsEntry(got, lang) == tT[i];
+                        if (!ok) throw new Exception("read back '" + got + "' does not hold the requested text in " + lang);
+                        if (tK[i] && lang != "raw")
+                        {
+                            List<string[]> olds = MlsSegs((string)p[2]);
+                            if (olds != null)
+                                foreach (string[] g in olds)
+                                    if (g[0] != lang && MlsEntry(got, g[0]) != g[1])
+                                        throw new Exception("language " + g[0] + " changed: '" + g[1] + "' -> '" + MlsEntry(got, g[0]) + "'");
+                        }
+                        string geom1 = TxGeom(t, !hReq);
+                        it["othersUnchanged"] = geom0 == geom1;
+                        if (geom0 != geom1)
+                        {
+                            it["geomBefore"] = geom0;
+                            it["geomAfter"] = geom1;
+                            throw new Exception("location / height / justification / layer / colour / visibility changed with the contents");
+                        }
+                        if (hReq && Math.Abs(TxNum(t, "Height", -1) - tHt[i]) > 0.0005)
+                            throw new Exception("height reads " + TxNum(t, "Height", -1) + ", not " + tHt[i]);
+                        string disp = TxDisplayed(t);
+                        if (disp != null)
+                        {
+                            it["displayed"] = disp;
+                            it["displayedMatches"] = lang == "raw" ? MlsTexts(tT[i]).Contains(MlsNorm(disp)) : MlsNorm(disp) == MlsNorm(tT[i]);
+                        }
+                        it["verified"] = true;
+                        it["result"] = "changed";
+                    }
+                    catch (Exception ex)
+                    {
+                        failedAt = new Dictionary<string, object>();
+                        failedAt["i"] = i;
+                        failedAt["handle"] = tH[i];
+                        failedAt["step"] = step;
+                        failedAt["error"] = Flatten(ex);
+                        break;
+                    }
+                }
+                if (failedAt != null)
+                {
+                    results["failedAt"] = failedAt;
+                    if (tRb)
+                    {
+                        int rb = 0;
+                        List<string> rbErr = new List<string>();
+                        for (int k = undo.Count - 1; k >= 0; k--)
+                        {
+                            object[] u = undo[k];
+                            Dictionary<string, object> itU = (Dictionary<string, object>)items[(int)u[4]];
+                            try
+                            {
+                                // only what really changed (the failed write may have changed nothing)
+                                PropertyInfo cp = (PropertyInfo)u[1];
+                                bool textMoved = !MlsSame(MlsRaw(TryRead(u[0], "Contents", null)), (string)u[2]);
+                                bool hMoved = (double)u[3] > 0 && Math.Abs(TxNum(u[0], "Height", -1) - (double)u[3]) > 0.0005;
+                                if (textMoved)
+                                {
+                                    object m = Activator.CreateInstance(cp.PropertyType);
+                                    if (((string)u[2]).Length > 0)
+                                        Call(RequireMethod(cp.PropertyType, "SetAsString", new string[] { "String" }, false), m, new object[] { u[2] });
+                                    cp.SetValue(u[0], m, null);
+                                }
+                                if (hMoved) RequireWritable(u[0].GetType(), "Height").SetValue(u[0], (double)u[3], null);
+                                if (textMoved || hMoved) { rb++; itU["result"] = "rolledBack"; }
+                                else itU["result"] = "notWritten";
+                            }
+                            catch (Exception exr) { rbErr.Add(Flatten(exr)); itU["result"] = "rollbackFailed"; }
+                        }
+                        results["rolledBack"] = rb;
+                        if (rbErr.Count > 0) results["rollbackErrors"] = rbErr;
+                    }
+                }
+                else if (rows != null)
+                {
+                    // FUNC_TEXT_AUTOMATIC is evaluated by EPLAN - read it again
+                    List<object> changed = new List<object>();
+                    int nChanged = 0;
+                    Dictionary<int, int> perItem = new Dictionary<int, int>();
+                    foreach (object[] r in rows)
+                    {
+                        string now = FnTextProp(r[0], "FUNC_TEXT_AUTOMATIC");
+                        if (now == (string)r[6]) continue;
+                        nChanged++;
+                        int which = -1;
+                        foreach (object[] p in plan)
+                            if (!(bool)p[6] && TxKind(p[1]) == 2 && MlsShares(now, MlsRaw(p[3]))) { which = (int)p[0]; break; }
+                        if (which >= 0) { int c0; perItem.TryGetValue(which, out c0); perItem[which] = c0 + 1; }
+                        if (changed.Count >= tChMax) continue;
+                        Dictionary<string, object> d = new Dictionary<string, object>();
+                        d["handle"] = r[1];
+                        d["name"] = r[2];
+                        d["page"] = r[3];
+                        d["before"] = r[6];
+                        d["after"] = now;
+                        if (which >= 0) d["item"] = which;
+                        changed.Add(d);
+                    }
+                    foreach (KeyValuePair<int, int> kv in perItem)
+                        ((Dictionary<string, object>)items[kv.Key])["functionsChangedCount"] = kv.Value;
+                    results["functionsChangedCount"] = nChanged;
+                    results["functionsChanged"] = changed;
+                }
+            }
+'''
+
+_TEXT_LANG = re.compile(r"^[a-z]{2}_[A-Z]{2}$")
+_TEXT_ITEM_KEYS = frozenset({"handle", "text", "language", "page", "height", "keep_other_languages"})
+_TEXT_FN_SCOPES = ("page", "project", "none")
+
+
+def _text_language(value, what):
+    v = "auto" if value is None else value
+    if not isinstance(v, str):
+        raise SchematicValueError("%s must be a string, got %r." % (what, v))
+    v = v.strip()
+    if v in ("auto", "raw", "??_??") or _TEXT_LANG.match(v):
+        return v
+    raise SchematicValueError(
+        "%s must be 'auto' (the one language the text has, '??_??' when it has none), '??_??' "
+        "(language independent), a language such as 'sl_SI' / 'en_US', or 'raw' (text is a whole "
+        "MultiLangString 'sl_SI@..;en_US@..;'), got %r." % (what, value))
+
+
+def live_set_texts(items: list = None, handle: str = None, text: str = None, page: str = None,
+                   language: str = "auto", keep_other_languages: bool = True,
+                   dry_run: bool = True, allow_real_project: bool = False,
+                   rollback_on_error: bool = True, check_functions: str = "page",
+                   function_list_limit: int = 3, max_items: int = 200, verbose: bool = False,
+                   timeout_seconds: float = 300.0) -> dict:
+    """
+    v10: CHANGE THE CONTENTS of existing free texts on the sheet - Text and
+    PathText (path function text / Pfadfunktionstext, the magenta text under a
+    device) - by handle, many in one call. WRITES (unless dry_run, the
+    default) - scratch-only unless allow_real_project=True (dry_run only reads).
+
+    Only Text.Contents (MultiLangString) changes; location, layer, colour,
+    justification, visibility and height stay (height only if given). A path
+    function text feeds FUNC_TEXT_AUTOMATIC (#20031, "Function text
+    (automatic)") of the functions of its path whose FUNC_TEXT is empty, and
+    so the PLC cards / overview connection points; EPLAN evaluates that
+    property itself (read-only, no setter, no refresh action in API 2.9) -
+    this tool reads it before and after and reports what changed. Property
+    texts of a symbol (PropertyPlacement) are refused - use
+    live_set_function_properties for the property value.
+
+    Handles: live_read_page(page, types=["Text", "PathText"],
+    include_text_content=True) - "textContent" gives the contents and the
+    functions that show a path text. Handles are session-scoped.
+
+    Args:
+        items: [{"handle", "text", "language"?, "page"?, "height"?,
+            "keep_other_languages"?}] (up to max_items, default 200) - or
+            handle= + text= for one text.
+        language: default for the items - "auto" (default: the one language
+            the text already has, "??_??" when it has none; a text with
+            several languages is refused - name one), "??_??" (language
+            independent), "sl_SI" / "en_US" / ... (that entry), or "raw" (text
+            is the whole MultiLangString "sl_SI@a;en_US@b;", every language
+            replaced). The text must not contain ";" (it separates languages)
+            except with "raw". Line breaks: "\\n".
+        keep_other_languages: default True - entries of other languages
+            stay; False keeps only the written one.
+        page: optional, default page of the items - resolve the handles on
+            this page only (faster; without it every page is searched).
+        dry_run: default True - per item "before", "language", "after" (the
+            new MultiLangString), "action" change/unchanged, and for a path
+            text "functionsShowingOldCount" / "functionsShowingOld" (functions
+            with an empty FUNC_TEXT whose FUNC_TEXT_AUTOMATIC shows the old
+            text, nearest first, "dx" = x distance - the same text under
+            another path matches too); nothing changed.
+        allow_real_project: must be True to write outside the scratch root.
+        rollback_on_error: default True - an error or a failed read-back
+            undoes every text of this call (contents and height).
+        check_functions: "page" (default: functions on the pages of the
+            changed path texts), "project" (every function - also the overview
+            PLC points of a card page) or "none".
+        function_list_limit: functions listed per path text / changed
+            (default 3; changed list: 20 x this).
+        verbose: full text record ("record") per item.
+        timeout_seconds: default 300.
+
+    Returns:
+        {"success", "dryRun", "counts" {change/unchanged | changed/unchanged},
+         "items": [{i, handle, kind Text/PathText, page, before, textBefore,
+         language, after, textAfter, action, result changed/unchanged,
+         verified, othersUnchanged, displayed, displayedMatches,
+         functionsShowingOldCount, functionsShowingOld, functionsChangedCount}],
+         "functionsChecked", "functionsChangedCount", "functionsChanged"
+         [{handle, name, page, before, after, item}], "warnings"}.
+        "before" is the old MultiLangString: language="raw", text=before
+        restores a text. A failed write: success false, errorType
+        "ROLLED_BACK" (or "PARTIAL"), "failedAt" {i, handle, step, error}.
+    """
+    try:
+        if items is not None and not isinstance(items, (list, tuple)):
+            raise SchematicValueError("items must be a list of {handle, text, language?, page?, height?}.")
+        raw_items = list(items or [])
+        if handle is not None or text is not None:
+            if handle is None or text is None:
+                raise SchematicValueError("Give handle= and text= together (or items=[...]).")
+            raw_items.append({"handle": handle, "text": text})
+        if not raw_items:
+            raise SchematicValueError("Nothing to change: give items=[{handle, text}] or handle= + text=.")
+        mx = cs_int(max_items, "max_items", minimum=1, maximum=1000)
+        if len(raw_items) > mx:
+            raise SchematicValueError("%d items, more than max_items=%d - nothing changed." % (len(raw_items), mx))
+        dflt_lang = _text_language(language, "language")
+        dflt_page = cs_text(page, "page", allow_empty=True)
+        if check_functions not in _TEXT_FN_SCOPES:
+            raise SchematicValueError("check_functions must be 'page', 'project' or 'none', got %r." % (check_functions,))
+        fmax = cs_int(function_list_limit, "function_list_limit", minimum=0, maximum=50)
+        hs, ts, ls, ps, ks, hts = [], [], [], [], [], []
+        for n, it in enumerate(raw_items):
+            if not isinstance(it, dict):
+                raise SchematicValueError("items[%d] must be a dict {handle, text, ...}, got %r." % (n, it))
+            extra = set(it) - _TEXT_ITEM_KEYS
+            if extra:
+                raise SchematicValueError("items[%d]: unknown key(s) %s (allowed: %s)."
+                                          % (n, sorted(extra), ", ".join(sorted(_TEXT_ITEM_KEYS))))
+            h = it.get("handle")
+            if not isinstance(h, str) or not h.strip():
+                raise SchematicValueError("items[%d]: handle must be a non-empty string." % n)
+            h = h.strip()
+            if h in hs:
+                raise SchematicValueError("items[%d]: handle %s is given twice." % (n, h))
+            t = it.get("text")
+            if not isinstance(t, str):
+                raise SchematicValueError("items[%d]: text must be a string (\"\" clears it), got %r." % (n, t))
+            t = cs_text(t, "items[%d].text" % n, allow_empty=True)
+            lang = _text_language(it.get("language", dflt_lang), "items[%d].language" % n)
+            if lang == "raw":
+                disp, _ = multilang_display(t)
+                if t and disp is None:
+                    raise SchematicValueError("items[%d]: language 'raw' needs the MultiLangString form "
+                                              "'sl_SI@text;en_US@text;', got %r." % (n, t))
+            elif ";" in t:
+                raise SchematicValueError("items[%d]: ';' separates languages in EPLAN's MultiLangString - "
+                                          "not allowed in a text (use language='raw' for a whole MultiLangString)." % n)
+            pg = it.get("page", dflt_page)
+            pg = cs_text(pg, "items[%d].page" % n, allow_empty=True)
+            hv = it.get("height")
+            hts.append(-1.0 if hv is None else float(cs_double(hv, "items[%d].height" % n)))
+            if hv is not None and not 0 < hts[-1] <= 100:
+                raise SchematicValueError("items[%d]: height must be > 0 and <= 100 mm." % n)
+            keep = it.get("keep_other_languages", keep_other_languages)
+            hs.append(h)
+            ts.append(t)
+            ls.append(lang)
+            ps.append(pg)
+            ks.append(bool(keep))
+        body = ("" if dry_run else _guard_prelude(allow_real_project)) + _fill(
+            _SET_TEXTS_BODY,
+            V10H=_cs_lit_array(hs), V10T=_cs_lit_array(ts), V10L=_cs_lit_array(ls), V10P=_cs_lit_array(ps),
+            V10K=_cs_bool_array(ks), V10HT=_cs_double_array(hts), V10DRY=cs_bool(dry_run),
+            V10RB=cs_bool(rollback_on_error), V10FN='"%s"' % check_functions, V10FMAX=str(fmax),
+            V10CHMAX=str(max(fmax, 1) * 20), V10VERB=cs_bool(verbose))
+    except (SchematicValueError, TypeError, ValueError) as exc:
+        return _err(exc)
+
+    out = _shape_keep(_execute_script(
+        _script(_cls("SetTexts"), body,
+                extra_helpers=_HELPERS_SCHEMATIC + _HELPERS_PROPS + _HELPERS_V10),
+        timeout=timeout_seconds,
+    ), keep=("items", "failedAt", "rolledBack", "rollbackErrors", "project"))
+    for it in out.get("items") or []:
+        for src, dst in (("before", "textBefore"), ("after", "textAfter")):
+            if isinstance(it.get(src), str):
+                it[dst], _ = _text_display(it[src])
+    if not out.get("success"):
+        return out
+    out["dryRun"] = bool(dry_run)
+    counts, warnings = {}, []
+    for it in out.get("items") or []:
+        key = it.get("result") or it.get("action") or "?"
+        counts[key] = counts.get(key, 0) + 1
+    out["counts"] = counts
+    nomatch = [str(it.get("handle")) for it in out.get("items") or [] if it.get("displayedMatches") is False]
+    if nomatch:
+        warnings.append("Displayed text differs from the written text on %d text(s) (%s) - another language entry "
+                        "is displayed (project display language); write that language or language='??_??' with "
+                        "keep_other_languages=false." % (len(nomatch), ", ".join(nomatch[:10])))
+    paths = [it for it in out.get("items") or [] if it.get("kind") == "PathText" and it.get("result") == "changed"]
+    if paths and check_functions != "none" and not out.get("functionsChangedCount") and not out.get("failedAt"):
+        warnings.append("No FUNC_TEXT_AUTOMATIC changed within this call (%d function(s) checked, scope %s). EPLAN "
+                        "evaluates it itself - re-read with live_read_function_properties(properties="
+                        "[\"FUNC_TEXT\", \"FUNC_TEXT_AUTOMATIC\"]); a function with its own FUNC_TEXT keeps it."
+                        % (out.get("functionsChecked") or 0, check_functions))
+    if dry_run and any(it.get("kind") == "PathText" and it.get("action") == "change" for it in out.get("items") or []):
+        warnings.append("Path function texts feed FUNC_TEXT_AUTOMATIC of the functions of their path whose FUNC_TEXT "
+                        "is empty (see functionsShowingOld) - a function with its own FUNC_TEXT does not change.")
+    if warnings:
+        out["warnings"] = warnings
+    if out.get("failedAt"):
+        out["success"] = False
+        out["errorType"] = "ROLLED_BACK" if rollback_on_error else "PARTIAL"
+        fa = out["failedAt"]
+        out["error"] = "Writing failed at item %s (%s, step %s): %s. %s" % (
+            fa.get("i"), fa.get("handle"), fa.get("step"), fa.get("error"),
+            "All texts of this call were restored." if rollback_on_error and not out.get("rollbackErrors")
+            else "Some changes stay - check the page.")
+    return out
+
+
+# ---------------------------------------------------------------------------
+# v10  live_set_function_properties(items=[...])
+# ---------------------------------------------------------------------------
+
+_SET_ITEMS_BODY = r'''
+            string[] iH = V10IH;
+            string[] iN = V10IN;
+            string[] iP = V10IP;
+            string[] iC = V10IC;
+            int[] iLim = V10ILIM;
+            int[] rI = V10RI;
+            string[] rN = V10RN;
+            int[] rX = V10RX;
+            string[] rV = V10RV;
+            bool pDry = V10DRY;
+            bool pRb = V10RB;
+            bool pVerbose = V10VERB;
+
+            // ---- 1. the project's functions, indexed once (handle, exact name) --
+            Dictionary<string, object> fByH = new Dictionary<string, object>();
+            Dictionary<string, List<object>> fByN = new Dictionary<string, List<object>>();
+            foreach (object fn in AllFunctions(project))
+            {
+                if (fn == null) continue;
+                string h = Handle(fn);
+                if (h != null && !fByH.ContainsKey(h)) fByH[h] = fn;
+                string n = PropText(fn, "Name");
+                if (n == null) continue;
+                List<object> l;
+                if (!fByN.TryGetValue(n, out l)) { l = new List<object>(); fByN[n] = l; }
+                l.Add(fn);
+            }
+
+            // ---- 2. resolve and validate EVERY item before the first write -----
+            List<string> problems = new List<string>();
+            List<List<object>> targets = new List<List<object>>();
+            Dictionary<string, int> usedBy = new Dictionary<string, int>();
+            int nFn = 0;
+            for (int k = 0; k < iH.Length; k++)
+            {
+                List<object> cand = new List<object>();
+                if (iH[k].Length > 0)
+                {
+                    object f;
+                    if (fByH.TryGetValue(iH[k], out f) && FnMatches(f, iN[k], "", iP[k], iC[k], "", "")) cand.Add(f);
+                }
+                else
+                {
+                    List<object> l;
+                    if (fByN.TryGetValue(iN[k], out l))
+                        foreach (object f in l) if (FnMatches(f, "", "", iP[k], iC[k], "", "")) cand.Add(f);
+                }
+                targets.Add(cand);
+                string sel = (iH[k].Length > 0 ? iH[k] : iN[k]) + (iP[k].Length > 0 ? " @" + iP[k] : "") + (iC[k].Length > 0 ? " :" + iC[k] : "");
+                if (cand.Count == 0) { problems.Add("item " + k + " (" + sel + "): no function"); continue; }
+                if (cand.Count > iLim[k]) { problems.Add("item " + k + " (" + sel + "): " + cand.Count + " functions match, limit " + iLim[k]); continue; }
+                nFn += cand.Count;
+                foreach (object f in cand)
+                {
+                    string fh = Handle(f);
+                    int prevK;
+                    if (fh != null && usedBy.TryGetValue(fh, out prevK))
+                        problems.Add("item " + k + " (" + sel + "): function " + fh + " is also the target of item " + prevK);
+                    else if (fh != null) usedBy[fh] = k;
+                    object props = FnProps(f);
+                    for (int r = 0; r < rI.Length; r++)
+                    {
+                        if (rI[r] != k) continue;
+                        if (FnPropInfo(props, rN[r], rX[r]) == null)
+                            problems.Add("item " + k + " (" + sel + "): property " + rN[r] + (rX[r] > 0 ? "[" + rX[r] + "]" : "") +
+                                " is not declared by " + props.GetType().Name);
+                    }
+                }
+                if (problems.Count > 50) break;
+            }
+            results["matchedFunctions"] = nFn;
+            if (problems.Count > 0)
+                throw new Exception("Nothing written - " + problems.Count + " problem(s): " +
+                    string.Join("; ", problems.GetRange(0, Math.Min(20, problems.Count)).ToArray()));
+
+            // ---- 3. write (or count), read back; undo all of this call on an error
+            int written = 0, unchanged = 0, verified = 0, nUnver = 0;
+            List<object> unver = new List<object>();
+            List<object> details = new List<object>();
+            List<object[]> undo = new List<object[]>();   // {fn, name, idx, previous}
+            Dictionary<string, object> failedAt = null;
+            for (int k = 0; k < iH.Length && failedAt == null; k++)
+            {
+                foreach (object f in targets[k])
+                {
+                    List<object> plist = null;
+                    if (pVerbose)
+                    {
+                        Dictionary<string, object> d = new Dictionary<string, object>();
+                        d["item"] = k;
+                        d["name"] = PropText(f, "Name");
+                        d["handle"] = Handle(f);
+                        d["page"] = FnPageName(f);
+                        plist = new List<object>();
+                        d["properties"] = plist;
+                        details.Add(d);
+                    }
+                    string step = "";
+                    try
+                    {
+                        for (int r = 0; r < rI.Length; r++)
+                        {
+                            if (rI[r] != k) continue;
+                            string key = rX[r] > 0 ? rN[r] + "[" + rX[r] + "]" : rN[r];
+                            step = key;
+                            string before;
+                            ReadFnProp(FnProps(f), rN[r], rX[r], out before);
+                            if (before == null) before = "";
+                            Dictionary<string, object> pd = null;
+                            if (plist != null)
+                            {
+                                pd = new Dictionary<string, object>();
+                                pd["property"] = key;
+                                pd["previous"] = before;
+                                pd["requested"] = rV[r];
+                                plist.Add(pd);
+                            }
+                            if (before == rV[r] || MlsEntryAny(before, rV[r]))
+                            {
+                                unchanged++;
+                                if (pd != null) pd["result"] = "unchanged";
+                                continue;
+                            }
+                            if (pDry)
+                            {
+                                written++;
+                                if (pd != null) pd["result"] = "wouldWrite";
+                                continue;
+                            }
+                            undo.Add(new object[] { f, rN[r], rX[r], before });
+                            string route = FnWrite(f, rN[r], rX[r], rV[r]);
+                            written++;
+                            string after;
+                            ReadFnProp(FnProps(f), rN[r], rX[r], out after);
+                            bool ok = after == rV[r] || MlsEntryAny(after, rV[r]);
+                            if (ok) verified++;
+                            else
+                            {
+                                nUnver++;
+                                if (unver.Count < 50)
+                                {
+                                    Dictionary<string, object> u = new Dictionary<string, object>();
+                                    u["item"] = k;
+                                    u["handle"] = Handle(f);
+                                    u["name"] = PropText(f, "Name");
+                                    u["property"] = key;
+                                    u["requested"] = rV[r];
+                                    u["new"] = after;
+                                    unver.Add(u);
+                                }
+                            }
+                            if (pd != null) { pd["route"] = route; pd["new"] = after; pd["verified"] = ok; pd["result"] = "written"; }
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        failedAt = new Dictionary<string, object>();
+                        failedAt["item"] = k;
+                        failedAt["handle"] = Handle(f);
+                        failedAt["name"] = PropText(f, "Name");
+                        failedAt["property"] = step;
+                        failedAt["error"] = Flatten(ex);
+                        break;
+                    }
+                }
+            }
+            Dictionary<string, object> counts = new Dictionary<string, object>();
+            counts["items"] = iH.Length;
+            counts["functions"] = nFn;
+            counts[pDry ? "wouldWrite" : "written"] = written;
+            counts["unchanged"] = unchanged;
+            if (!pDry) { counts["verified"] = verified; counts["unverified"] = nUnver; }
+            results["counts"] = counts;
+            results["dryRun"] = pDry;
+            if (unver.Count > 0) results["unverified"] = unver;
+            if (pVerbose) results["details"] = details;
+            if (failedAt != null)
+            {
+                results["failedAt"] = failedAt;
+                if (pRb)
+                {
+                    int rb = 0;
+                    List<string> rbErr = new List<string>();
+                    for (int q = undo.Count - 1; q >= 0; q--)
+                    {
+                        object[] u = undo[q];
+                        try
+                        {
+                            string cur;
+                            ReadFnProp(FnProps(u[0]), (string)u[1], (int)u[2], out cur);
+                            if (cur == (string)u[3]) continue;   // the failed write changed nothing
+                            FnRestore(u[0], (string)u[1], (int)u[2], (string)u[3]);
+                            rb++;
+                        }
+                        catch (Exception exr) { rbErr.Add(Flatten(exr)); }
+                    }
+                    results["rolledBack"] = rb;
+                    if (rbErr.Count > 0) results["rollbackErrors"] = rbErr;
+                }
+            }
+'''
+
+_FP_ITEM_KEYS = frozenset({"handle", "name", "page", "connection_designation", "values", "limit"})
+
+
+def _set_function_properties_items(items, allow_real_project, timeout_seconds, dry_run,
+                                   rollback_on_error, verbose, max_items):
+    """v10: live_set_function_properties(items=[...]) - one script, one LockingStep."""
+    try:
+        if not isinstance(items, (list, tuple)) or not items:
+            raise SchematicValueError("items must be a non-empty list of {handle | name (+page, "
+                                      "connection_designation), values: {property: value}, limit?}.")
+        mx = cs_int(max_items, "max_items", minimum=1, maximum=2000)
+        if len(items) > mx:
+            raise SchematicValueError("%d items, more than max_items=%d - nothing written." % (len(items), mx))
+        ih, inm, ip, ic, ilim = [], [], [], [], []
+        ri, rn, rx, rv = [], [], [], []
+        for k, it in enumerate(items):
+            if not isinstance(it, dict):
+                raise SchematicValueError("items[%d] must be a dict, got %r." % (k, it))
+            extra = set(it) - _FP_ITEM_KEYS
+            if extra:
+                raise SchematicValueError("items[%d]: unknown key(s) %s (allowed: %s)."
+                                          % (k, sorted(extra), ", ".join(sorted(_FP_ITEM_KEYS))))
+            h = cs_text(it.get("handle"), "items[%d].handle" % k, allow_empty=True).strip()
+            nm = cs_text(it.get("name"), "items[%d].name" % k, allow_empty=True).strip()
+            if not h and not nm:
+                raise SchematicValueError("items[%d]: give handle or name (+ page / connection_designation)." % k)
+            vals = it.get("values")
+            if not isinstance(vals, dict) or not vals:
+                raise SchematicValueError("items[%d]: values must be a non-empty dict {property: value}." % k)
+            ih.append(h)
+            inm.append(nm)
+            ip.append(cs_text(it.get("page"), "items[%d].page" % k, allow_empty=True))
+            ic.append(cs_text(None if it.get("connection_designation") is None else str(it["connection_designation"]),
+                              "items[%d].connection_designation" % k, allow_empty=True))
+            ilim.append(cs_int(it.get("limit", 1), "items[%d].limit" % k, minimum=1, maximum=50))
+            for key, v in vals.items():
+                if v is None:
+                    raise SchematicValueError("items[%d]: value for %s must not be None (use \"\" to clear)." % (k, key))
+                (pname, pidx), = _parse_props([key], "items[%d].values" % k)
+                ri.append(k)
+                rn.append(pname)
+                rx.append(pidx)
+                rv.append(cs_text(str(v), "items[%d] value for %s" % (k, key), allow_empty=True))
+        body = ("" if dry_run else _guard_prelude(allow_real_project)) + _fill(
+            _SET_ITEMS_BODY,
+            V10IH=_cs_lit_array(ih), V10IN=_cs_lit_array(inm), V10IP=_cs_lit_array(ip), V10IC=_cs_lit_array(ic),
+            V10ILIM=_cs_int_array(ilim), V10RI=_cs_int_array(ri), V10RN=_cs_str_array(rn), V10RX=_cs_int_array(rx),
+            V10RV=_cs_lit_array(rv), V10DRY=cs_bool(dry_run), V10RB=cs_bool(rollback_on_error),
+            V10VERB=cs_bool(verbose))
+    except (SchematicValueError, TypeError, ValueError) as exc:
+        return _err(exc)
+
+    out = _shape_keep(_execute_script(
+        _script(_cls("SetFnPropsItems"), body,
+                extra_helpers=_HELPERS_SCHEMATIC + _HELPERS_PROPS + _HELPERS_V10),
+        timeout=timeout_seconds,
+    ), keep=("counts", "failedAt", "rolledBack", "rollbackErrors", "details", "project"))
+    if not out.get("success"):
+        return out
+    out["dryRun"] = bool(dry_run)
+    if out.get("unverified"):
+        out["warning"] = ("Read-back differs from the requested value on %d write(s) - see 'unverified' (EPLAN may "
+                          "reformat a value or refuse it silently)." % (out.get("counts") or {}).get("unverified", 0))
+    if out.get("failedAt"):
+        out["success"] = False
+        out["errorType"] = "ROLLED_BACK" if rollback_on_error else "PARTIAL"
+        fa = out["failedAt"]
+        out["error"] = "Writing failed at item %s (%s, %s): %s. %s" % (
+            fa.get("item"), fa.get("name") or fa.get("handle"), fa.get("property"), fa.get("error"),
+            "All writes of this call were undone." if rollback_on_error and not out.get("rollbackErrors")
+            else "Some writes stay - check with live_read_function_properties.")
     return out

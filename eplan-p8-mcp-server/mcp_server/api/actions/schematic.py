@@ -23,6 +23,9 @@ live_props.live_place_function_property.
 v9: a property text's Location is RELATIVE to its symbol's insertion point
 (EPLAN 2.9) - live_move_placements no longer moves such texts a
 second time; live_read_page also reports relationIndex.
+v10: live_read_page(include_text_content=True) returns the contents of Text and
+PathText (MultiLangString per language and as displayed, height, layer, colour)
+and the functions that show a path function text (FUNC_TEXT_AUTOMATIC).
 v8: live_move_placements moves placements (one macro / device, a list, a
 rectangle) by setting Placement.Location - nothing removed or re-inserted.
 
@@ -1991,10 +1994,28 @@ def _pp_display(out):
                 pp["displayText"] = disp
 
 
+def _text_display(out):
+    """v10: "text" (first language) and "byLanguage" of every textContent."""
+    try:
+        from .live_props import multilang_display
+    except ImportError:  # pragma: no cover
+        return
+    for pl in out.get("placements") or []:
+        rec = pl.get("textContent")
+        if not isinstance(rec, dict) or not isinstance(rec.get("raw"), str):
+            continue
+        disp, by_lang = multilang_display(rec["raw"])
+        rec["text"] = rec["raw"] if disp is None else disp
+        if by_lang is not None:
+            rec["byLanguage"] = by_lang
+
+
 def live_read_page(page: str, include_pins: bool = True, limit: int = 200,
                    types: list = None, timeout_seconds: float = 90.0,
                    include_property_placements: bool = False,
-                   property_placements_limit: int = 50) -> dict:
+                   property_placements_limit: int = 50,
+                   include_text_content: bool = False,
+                   text_functions_limit: int = 5) -> dict:
     """
     Read one page's full state: every placement, its geometry and its pins.
 
@@ -2036,6 +2057,21 @@ def live_read_page(page: str, include_pins: bool = True, limit: int = 200,
             unchanged). To show a hidden or missing one use
             live_place_function_property.
         property_placements_limit: v8, max texts per symbol (default 50).
+        include_text_content: v10. True: every Text and PathText (path
+            function text) also gets "textContent": {"kind" Text /
+            PathText, "raw" (MultiLangString "sl_SI@..;en_US@..;", "??_??" =
+            language independent), "text" (first language), "byLanguage",
+            "displayed" (GetDisplayString), "location", "height",
+            "justification", "layer", "textColorId" (-16002 = from layer),
+            "setAsVisible", "rotation", "languageMode"}; a PathText also
+            "functionsShowingIt" [{handle, name, dx}] and
+            "functionsShowingItCount": functions of this page with an EMPTY
+            FUNC_TEXT whose FUNC_TEXT_AUTOMATIC (#20031) shows the text,
+            nearest first (dx = x distance; the same text under another path
+            matches too). Use types=["PathText"] or ["Text", "PathText"].
+            Default False (output unchanged). To change a text: live_set_texts.
+        text_functions_limit: v10, functions listed per path text (default 5,
+            0 = do not look for them).
 
     Returns:
         {"success", "page", "pageType", "gridSize", "size", "placementCount",
@@ -2064,6 +2100,7 @@ def live_read_page(page: str, include_pins: bool = True, limit: int = 200,
             if not types:
                 types = None
         pp_max = cs_int(property_placements_limit, "property_placements_limit", minimum=1, maximum=500)
+        tf_max = cs_int(text_functions_limit, "text_functions_limit", minimum=0, maximum=100)
     except SchematicValueError as exc:
         return _err(exc)
 
@@ -2077,6 +2114,12 @@ def live_read_page(page: str, include_pins: bool = True, limit: int = 200,
 '''
     if include_property_placements:
         body += _fill(_READ_PP_BODY, V8PPMAX=str(pp_max))
+    helpers = _HELPERS_SCHEMATIC
+    if include_text_content:
+        # v10: lazy - live_props imports this module
+        from .live_props import _HELPERS_PROPS, _HELPERS_V10, _READ_TEXT_BODY
+        body += _fill(_READ_TEXT_BODY, V10FMAX=str(tf_max))
+        helpers = _HELPERS_SCHEMATIC + _HELPERS_PROPS + _HELPERS_V10
     body = _fill(
         body,
         PAGENAME='"%s"' % page_cs,
@@ -2086,13 +2129,15 @@ def live_read_page(page: str, include_pins: bool = True, limit: int = 200,
     )
 
     out = _shape(_execute_script(
-        _script(_cls("ReadPage"), body, extra_helpers=_HELPERS_SCHEMATIC),
+        _script(_cls("ReadPage"), body, extra_helpers=helpers),
         timeout=timeout_seconds,
     ))
     if out.get("success"):
         _annotate_pins(out)
         if include_property_placements:
             _pp_display(out)
+        if include_text_content:
+            _text_display(out)
     return out
 
 
