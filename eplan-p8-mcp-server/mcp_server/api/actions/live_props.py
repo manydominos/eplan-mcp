@@ -26,8 +26,12 @@ select by handle (from live_read_function_properties / live_read_page) or by
 name + connection point designation (+ page), and a write that matches more
 functions than `limit` is refused as a whole rather than applied partially.
 
-The device tag (BMK) is deliberately NOT written here - live_set_device_tag
-already does that with its merge guard.
+The device tag (BMK) is deliberately NOT written by live_set_function_properties
+- live_set_device_tag already does that with its merge guard. v5 adds
+live_set_device_tags: device tags (and the connection point designation) of
+PLC connection points, PLC boxes and every other Function subclass, one by
+handle or many in one call, validated before the first write, verified and
+rolled back on error (inbox 2026-10-28_eplan_bmk_plc_prikljucka_in_skatle.md).
 
 API names used on EPLAN 2.9 (eplan.help API 2.9):
     FunctionPropertyList.FUNC_PLCADDRESS                     #20400
@@ -46,6 +50,7 @@ import re
 from ._base import cs_escape
 from .live import _script
 from .scripted import _execute_script
+from . import scripted as _scripted
 from .schematic import _HELPERS_SCHEMATIC, _guard_prelude, _fill, _shape, _cls, _err
 from .schematic_model import SchematicValueError, cs_bool, cs_double, cs_int, cs_text
 
@@ -53,6 +58,7 @@ __all__ = [
     "live_read_function_properties",
     "live_set_function_properties",
     "live_insert_window_macro",
+    "live_set_device_tags",
 ]
 
 
@@ -65,7 +71,13 @@ DEFAULT_READ_PROPERTIES = (
     "FUNC_PLCCHANNEL_DESIGNATION_CALCULATED",
     "FUNC_PLCDATATYPE",
     "FUNC_PLCSYMBOLICADDRESS_MANUAL",
+    # v5: the function text of a PLC connection point lives here (from the
+    # PLC structure data), FUNC_TEXT is empty on them (live test v4, Z2.1).
+    "FUNC_TEXT_AUTOMATIC",
 )
+
+# v5: replace_article modes of live_set_function_properties.
+_ARTICLE_MODES = ("auto", "project_only")
 
 # "FUNC_X" or "FUNC_X[3]" - the name becomes a reflection lookup (a string
 # literal), the index is interpolated as code, so both are validated here.
@@ -404,6 +416,49 @@ _HELPERS_PROPS = r'''
         if (absent.Count > 0) d["absentMembers"] = absent;
         return d;
     }
+
+    // v5 (live_set_device_tags): one item's selector. Name: exact, device tag
+    // without ":x", or the last tag segment (NameMatches, schematic helpers).
+    static bool ItemMatches(object fn, string handle, string name, string pageName, string conn)
+    {
+        if (handle.Length > 0 && Handle(fn) != handle) return false;
+        if (name.Length > 0 && !NameMatches(PropText(fn, "Name"), name)) return false;
+        if (pageName.Length > 0 && FnPageName(fn) != pageName) return false;
+        if (conn.Length > 0)
+        {
+            object props;
+            try { props = FnProps(fn); } catch { return false; }
+            if (!ConnDesignations(props).Contains(conn)) return false;
+        }
+        return true;
+    }
+
+    // v5: FunctionBase.Name { get; set; } (API 2.9) - inherited unchanged by
+    // Terminal and PLC. Not FUNC_IDENTDEVICETAG & co.: those are computed and
+    // PropertyValue.Set throws S063113 on them.
+    static string SetFunctionName(object fn, string name)
+    {
+        PropertyInfo np = GetWritable(fn.GetType(), "Name");
+        if (np == null)
+            throw new Exception(fn.GetType().Name + " has no writable Name. " + MemberList(fn.GetType(), false));
+        try { np.SetValue(fn, name, null); }
+        catch (TargetInvocationException tie)
+        { throw new Exception("Name = '" + name + "' on " + fn.GetType().Name + ": " + Flatten(tie.InnerException)); }
+        return "Function.Name";
+    }
+
+    // v5: connection point designation at a 1-based index, read back.
+    static string SetConnDesignation(object fn, int idx, string value)
+    {
+        object props = FnProps(fn);
+        PropertyInfo ipi = GetPropInfoIdx(props.GetType(), "FUNC_CONNECTIONDESIGNATION");
+        if (ipi == null)
+            throw new Exception("FUNC_CONNECTIONDESIGNATION[int] is not declared by " + props.GetType().FullName);
+        object pv = ipi.GetValue(props, new object[] { idx });
+        Call(RequireMethod(pv.GetType(), "Set", new string[] { "String" }, false), pv, new object[] { value });
+        List<string> after = ConnDesignations(FnProps(fn));
+        return after.Count >= idx ? after[idx - 1] : "";
+    }
 '''
 
 
@@ -454,7 +509,8 @@ def live_read_function_properties(name: str = None, contains: str = None, page: 
             indexed: ["FUNC_PLCADDRESS", "FUNC_CONNECTIONDESIGNATION[1]"].
             Default: FUNC_TEXT, FUNC_PLCADDRESS,
             FUNC_PLCCHANNEL_DESIGNATION_MANUAL / _CALCULATED, FUNC_PLCDATATYPE,
-            FUNC_PLCSYMBOLICADDRESS_MANUAL. Names this EPLAN version does not
+            FUNC_PLCSYMBOLICADDRESS_MANUAL, FUNC_TEXT_AUTOMATIC (v5: the
+            function text of PLC connection points). Names this EPLAN version does not
             declare are listed in "unknownProperties" (with "plcPropertyNames",
             the PLC-related names it does declare) - never returned as "".
         include_articles: Also list the article references (part numbers).
@@ -557,7 +613,9 @@ def live_set_function_properties(values: dict = None, name: str = None, handle: 
                                  page: str = None, connection_designation: str = None,
                                  replace_article: dict = None, limit: int = 1,
                                  allow_real_project: bool = False,
-                                 timeout_seconds: float = 120.0) -> dict:
+                                 timeout_seconds: float = 120.0,
+                                 replace_article_mode: str = "auto",
+                                 allow_unverified_db: bool = False) -> dict:
     """
     Set FunctionPropertyList values of functions in the open project. WRITES -
     scratch-only unless allow_real_project=True.
@@ -568,7 +626,8 @@ def live_set_function_properties(values: dict = None, name: str = None, handle: 
     property name (and the article to replace) is validated on every target
     BEFORE the first write. Each write is read back from a fresh fetch.
 
-    The device tag (BMK) is not set here - use live_set_device_tag.
+    The device tag (BMK) is not set here - use live_set_device_tags (also PLC
+    connection points and PLC boxes, many at once) or live_set_device_tag.
 
     Args:
         values: {property: value}, e.g. {"FUNC_PLCADDRESS": "I1.0",
@@ -581,6 +640,18 @@ def live_set_function_properties(values: dict = None, name: str = None, handle: 
         limit: Max functions to modify (default 1).
         allow_real_project: Must be True to write outside the scratch root.
         timeout_seconds: Default 120.
+        replace_article_mode: v5, only with replace_article.
+            "auto" (default): first the same parts-database preflight as
+            parts_db_* - an Access database without 64-bit ACE is refused
+            (errorType PARTS_DB_UNAVAILABLE, NOTHING sent to EPLAN, no modal
+            dialog); undecidable -> PARTS_DB_UNVERIFIED (allow_unverified_db).
+            "project_only": no database check; the new part number is written
+            ONLY if the project already holds it as a project article
+            (Project.Articles), else errorType ARTICLE_NOT_IN_PROJECT and
+            nothing is written. Not verified on EPLAN 2.9 that EPLAN then never
+            reads the parts database - keep timeout_seconds short.
+        allow_unverified_db: v5, as in parts_db_*: with "auto", try even when
+            the preflight cannot decide.
 
     Returns:
         {"success", "project", "matched", "modified", "details": [{"name",
@@ -612,10 +683,33 @@ def live_set_function_properties(values: dict = None, name: str = None, handle: 
             raise SchematicValueError("Nothing to write: give values and/or replace_article.")
         limit = cs_int(limit, "limit", minimum=1, maximum=500)
         subs = _selector_subs(name, None, page, connection_designation, handle, None)
+        art_mode = str(replace_article_mode or "auto").strip().lower()
+        if art_mode not in _ARTICLE_MODES:
+            raise SchematicValueError("replace_article_mode must be 'auto' or 'project_only', got %r."
+                                      % (replace_article_mode,))
     except SchematicValueError as exc:
         return _err(exc)
 
+    if art_from and art_mode == "auto":
+        # v5 (inbox 2026-10-28_eplan_replace_article_modalno_okno.md): replacing
+        # an article can make EPLAN open the parts database - on a machine
+        # without 64-bit ACE a MODAL dialog that blocked EPLAN for 240 s. Same
+        # preflight as parts_db_*; on a refusal nothing is sent to EPLAN.
+        blocked = _scripted._parts_db_guard(allow_unverified_db)
+        if blocked:
+            out = dict(blocked)
+            if out.get("errorType") in ("PARTS_DB_UNAVAILABLE", "PARTS_DB_UNVERIFIED"):
+                out["error"] = "replace_article NOT run, nothing written. " + str(out.get("error") or "")
+                out["nothingWritten"] = True
+                out["alternative"] = (
+                    "If the new part number is already an article of this project, "
+                    "replace_article_mode='project_only' writes only the part number "
+                    "without a database check. Otherwise the parts database must be "
+                    "made available (64-bit ACE / SQL) - a user decision.")
+            return out
+
     body = _guard_prelude(allow_real_project) + '''
+            bool projectOnly = PROJECTONLY;
             string[] wNames = WNAMES;
             int[] wIdx = WIDX;
             string[] wVals = WVALS;
@@ -663,6 +757,35 @@ def live_set_function_properties(values: dict = None, name: str = None, handle: 
                             artFrom + "' - nothing written. Articles of the MAIN function are listed by " +
                             "live_read_function_properties(include_articles=true).");
                 }
+            }
+
+            // v5: project_only - write only a part number the project already
+            // holds as a project article (Project.Articles), so EPLAN has no
+            // reason to read the parts database. Checked BEFORE the first write.
+            if (artFrom.Length > 0 && projectOnly)
+            {
+                object parts = TryRead(project, "Articles", null);
+                if (!(parts is IEnumerable))
+                    throw new Exception("ARTICLE_NOT_IN_PROJECT: Project.Articles is not readable - nothing written. " +
+                        MemberList(project.GetType(), false));
+                bool inProject = false;
+                int nArt = 0;
+                foreach (object pa in (IEnumerable)parts)
+                {
+                    if (pa == null) continue;
+                    nArt++;
+                    object pn = TryRead(pa, "PartNr", null);
+                    if (string.Equals(pn == null ? null : SafeText(pn), artTo, StringComparison.OrdinalIgnoreCase))
+                    {
+                        inProject = true;
+                        break;
+                    }
+                }
+                results["projectArticlesChecked"] = nArt;
+                if (!inProject)
+                    throw new Exception("ARTICLE_NOT_IN_PROJECT: '" + artTo + "' is not an article of this project (" +
+                        nArt + " checked) - nothing written. Writing it would make EPLAN read it from the parts database.");
+                results["articleInProject"] = true;
             }
 
             List<object> details = new List<object>();
@@ -759,12 +882,16 @@ def live_set_function_properties(values: dict = None, name: str = None, handle: 
                  WVALS=_cs_str_array([v for _, _, v in items]),
                  ARTFROM='"%s"' % cs_escape(art_from),
                  ARTTO='"%s"' % cs_escape(art_to),
-                 MAXN=str(limit), **subs)
+                 MAXN=str(limit), PROJECTONLY=cs_bool(art_mode == "project_only"), **subs)
     out = _shape_keep(_execute_script(
         _script(_cls("SetFnProps"), body,
                 extra_helpers=_HELPERS_SCHEMATIC + _HELPERS_PROPS),
         timeout=timeout_seconds,
     ))
+    if not out.get("success") and "ARTICLE_NOT_IN_PROJECT" in str(out.get("error") or ""):
+        out["errorType"] = "ARTICLE_NOT_IN_PROJECT"
+    if art_from:
+        out["replaceArticleMode"] = art_mode
     if out.get("success"):
         _verify_by_display_text(out.get("details"))
         bad = [p["property"] for d in out.get("details") or []
@@ -952,7 +1079,7 @@ def live_insert_window_macro(page: str, macro_path: str, x: float, y: float,
                 }
             }
             results["duplicateNames"] = dup;
-            if (renamed.Count > 0) results["renamedExisting"] = renamed;
+            results["renamedExisting"] = renamed;   // v5: always a list ([] = none)
 
             int after = 0;
             foreach (object pl in PagePlacements(page)) if (pl != null) after++;
@@ -980,4 +1107,413 @@ def live_insert_window_macro(page: str, macro_path: str, x: float, y: float,
                 "Inserted device tag(s) already exist elsewhere in the project and "
                 "are merged into those devices: %s. Retag with live_set_device_tag "
                 "if that is not intended." % ", ".join(sorted(out["duplicateNames"])))
+    return out
+
+
+# ---------------------------------------------------------------------------
+# v5  device tags of functions, PLC connection points and PLC boxes
+# ---------------------------------------------------------------------------
+
+_TAG_ITEM_KEYS = frozenset({"handle", "name", "page", "connection", "tag",
+                            "connection_designation", "scope"})
+_TAG_SCOPES = ("function", "device")
+MAX_TAG_ITEMS = 500
+
+
+def _tag_items(items):
+    """Validated items -> list of dicts with every key present (strings)."""
+    if not isinstance(items, (list, tuple)) or not items:
+        raise SchematicValueError(
+            'items must be a non-empty list, e.g. [{"handle": "200/17/28925/0", "tag": "510K4", '
+            '"connection_designation": "1"}].')
+    if len(items) > MAX_TAG_ITEMS:
+        raise SchematicValueError("At most %d items per call, got %d." % (MAX_TAG_ITEMS, len(items)))
+    out = []
+    for n, it in enumerate(items):
+        what = "items[%d]" % n
+        if not isinstance(it, dict):
+            raise SchematicValueError("%s must be an object." % what)
+        extra = sorted(set(it) - _TAG_ITEM_KEYS)
+        if extra:
+            raise SchematicValueError("%s: unknown key(s) %s; allowed: %s."
+                                      % (what, extra, sorted(_TAG_ITEM_KEYS)))
+        d = {}
+        for k in ("handle", "name", "page", "connection", "connection_designation"):
+            v = it.get(k)
+            d[k] = cs_text(v, "%s.%s" % (what, k), allow_empty=True).strip() if v is not None else ""
+        if not d["handle"] and not d["name"]:
+            raise SchematicValueError("%s: give handle, or name (+ connection / page)." % what)
+        tag = cs_text(it.get("tag"), "%s.tag" % what).strip()
+        if ":" in tag:
+            raise SchematicValueError(
+                "%s.tag %r contains ':' - give the device tag only (e.g. \"510K4\") and the "
+                "connection point in connection_designation." % (what, tag))
+        if not tag.strip("-=+"):
+            raise SchematicValueError("%s.tag %r is not a device tag." % (what, tag))
+        d["tag"] = tag
+        scope = str(it.get("scope") or "function").strip().lower()
+        if scope not in _TAG_SCOPES:
+            raise SchematicValueError("%s.scope must be 'function' or 'device', got %r." % (what, it.get("scope")))
+        if scope == "device" and d["connection_designation"]:
+            raise SchematicValueError(
+                "%s: scope 'device' renames every function of the device and keeps their "
+                "connection points; connection_designation is only for scope 'function'." % what)
+        d["device"] = scope == "device"
+        out.append(d)
+    return out
+
+
+def _cs_bool_array(values):
+    return "new bool[] { " + ", ".join(cs_bool(v) for v in values) + " }"
+
+
+_SET_TAGS_BODY = '''
+            bool dryRun = DRYRUN;
+            bool allowMerge = ALLOWMERGE;
+            bool rollback = ROLLBACK;
+            string[] iHandle = IHANDLE;
+            string[] iName = INAME;
+            string[] iPage = IPAGE;
+            string[] iConn = ICONN;
+            string[] iTag = ITAG;
+            string[] iNewConn = INEWCONN;
+            bool[] iDevice = IDEVICE;
+            results["dryRun"] = dryRun;
+
+            // One walk over the project; Terminal / PLC / ... included.
+            List<object> all = new List<object>();
+            foreach (object fn0 in AllFunctions(project))
+                if (fn0 != null && IsFunctionObject(fn0)) all.Add(fn0);
+            results["functionsScanned"] = all.Count;
+
+            // 1. Resolve every item to exactly one function (scope device: to
+            //    every function with that device tag). Nothing is written yet.
+            List<object> tFn = new List<object>();
+            List<int> tItem = new List<int>();
+            List<string> tHandle = new List<string>();
+            for (int i = 0; i < iTag.Length; i++)
+            {
+                List<object> m = new List<object>();
+                List<string> seen = new List<string>();
+                foreach (object fn in all)
+                {
+                    if (!ItemMatches(fn, iHandle[i], iName[i], iPage[i], iConn[i])) continue;
+                    m.Add(fn);
+                    if (seen.Count < 10) seen.Add(PropText(fn, "Name") + " @" + FnPageName(fn) + " [" + Handle(fn) + "]");
+                }
+                if (m.Count == 0)
+                    throw new Exception("Item " + i + ": no function matches (handle '" + iHandle[i] + "', name '" +
+                        iName[i] + "', page '" + iPage[i] + "', connection '" + iConn[i] + "') - nothing written. " +
+                        "live_read_function_properties lists names, handles and connection points.");
+                if (m.Count > 1)
+                    throw new Exception("Item " + i + ": " + m.Count + " functions match - nothing written. " +
+                        "Narrow with connection / page / handle. Matches (up to 10): " + string.Join(" | ", seen.ToArray()));
+                List<object> group = new List<object>();
+                if (iDevice[i])
+                {
+                    string dt0 = DtPart(PropText(m[0], "Name"));
+                    foreach (object fn in all)
+                        if (string.Equals(DtPart(PropText(fn, "Name")), dt0, StringComparison.OrdinalIgnoreCase)) group.Add(fn);
+                }
+                else group.Add(m[0]);
+                foreach (object fn in group)
+                {
+                    string h = Handle(fn);
+                    int prev = tHandle.IndexOf(h);
+                    if (prev >= 0)
+                        throw new Exception("Items " + tItem[prev] + " and " + i + " both address " + PropText(fn, "Name") +
+                            " [" + h + "] - nothing written.");
+                    tFn.Add(fn);
+                    tItem.Add(i);
+                    tHandle.Add(h);
+                }
+            }
+
+            // 2. Plan: new device tag in the old structure, ":designation"
+            //    suffix kept (or moved to the new connection designation).
+            int n = tFn.Count;
+            string[] prevName = new string[n];
+            string[] newDt = new string[n];
+            string[] wantName = new string[n];
+            int[] connIdx = new int[n];
+            string[] prevConn = new string[n];
+            List<object> plan = new List<object>();
+            for (int k = 0; k < n; k++)
+            {
+                object fn = tFn[k];
+                int i = tItem[k];
+                string nm = PropText(fn, "Name");
+                if (nm == null) nm = "";
+                prevName[k] = nm;
+                string dt = DtPart(nm);
+                string suffix = nm.Substring(dt.Length);
+                newDt[k] = ComposeDt(dt, iTag[i]);
+                connIdx[k] = 0;
+                prevConn[k] = "";
+                if (iNewConn[i].Length > 0)
+                {
+                    List<string> cds = ConnDesignations(FnProps(fn));
+                    int at = iConn[i].Length > 0 ? cds.IndexOf(iConn[i]) : (cds.Count == 1 ? 0 : -1);
+                    if (at < 0)
+                        throw new Exception("Item " + i + ": cannot tell which connection point designation of " + nm +
+                            " to change (designations: " + string.Join(", ", cds.ToArray()) +
+                            "). Give 'connection' - nothing written.");
+                    connIdx[k] = at + 1;
+                    prevConn[k] = cds[at];
+                    if (suffix == ":" + cds[at]) suffix = ":" + iNewConn[i];
+                }
+                wantName[k] = newDt[k] + suffix;
+                Dictionary<string, object> pd = new Dictionary<string, object>();
+                pd["item"] = i;
+                pd["handle"] = tHandle[k];
+                pd["page"] = FnPageName(fn);
+                pd["clrType"] = fn.GetType().Name;
+                pd["previousName"] = nm;
+                pd["newName"] = wantName[k];
+                if (connIdx[k] > 0)
+                {
+                    pd["connectionIndex"] = connIdx[k];
+                    pd["previousConnection"] = prevConn[k];
+                    pd["newConnection"] = iNewConn[i];
+                }
+                plan.Add(pd);
+            }
+            results["planned"] = plan;
+
+            // 3. Merges: a new device tag that other functions (not renamed
+            //    here) already carry makes these functions part of that device.
+            Dictionary<string, int> exCount = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+            Dictionary<string, List<string>> exSample = new Dictionary<string, List<string>>(StringComparer.OrdinalIgnoreCase);
+            foreach (object fn in all)
+            {
+                string h = Handle(fn);
+                if (tHandle.Contains(h)) continue;
+                string nmE = PropText(fn, "Name");
+                string dtE = DtPart(nmE);
+                if (dtE.Length == 0) continue;
+                if (!exCount.ContainsKey(dtE)) { exCount[dtE] = 0; exSample[dtE] = new List<string>(); }
+                exCount[dtE] = exCount[dtE] + 1;
+                if (exSample[dtE].Count < 5) exSample[dtE].Add(nmE + " @" + FnPageName(fn) + " [" + h + "]");
+            }
+            Dictionary<string, object> merges = new Dictionary<string, object>();
+            for (int k = 0; k < n; k++)
+            {
+                string key = newDt[k];
+                if (merges.ContainsKey(key)) continue;
+                if (string.Equals(key, DtPart(prevName[k]), StringComparison.OrdinalIgnoreCase)) continue;
+                if (!exCount.ContainsKey(key)) continue;
+                Dictionary<string, object> md = new Dictionary<string, object>();
+                md["existingFunctions"] = exCount[key];
+                md["examples"] = exSample[key];
+                merges[key] = md;
+            }
+            results["merges"] = merges;
+            List<string> mergeKeys = new List<string>(merges.Keys);
+            if (mergeKeys.Count > 0 && !allowMerge)
+            {
+                results["wouldRefuse"] = true;
+                if (!dryRun)
+                    throw new Exception("New device tag(s) already exist in the project - the functions would MERGE " +
+                        "into those devices: " + string.Join(", ", mergeKeys.ToArray()) + " - nothing written. " +
+                        "Pass allow_merge=true if that is intended (e.g. points joining their PLC card).");
+            }
+
+            // 4. Write, read back, verify; on an error roll back what was written.
+            if (!dryRun)
+            {
+                List<object> details = new List<object>();
+                List<object> undo = new List<object>();
+                results["details"] = details;
+                results["undo"] = undo;
+                bool[] nameTouched = new bool[n];
+                bool[] connTouched = new bool[n];
+                int modified = 0;
+                int k = 0;
+                try
+                {
+                    for (k = 0; k < n; k++)
+                    {
+                        object fn = tFn[k];
+                        int i = tItem[k];
+                        Dictionary<string, object> d = new Dictionary<string, object>((Dictionary<string, object>)plan[k]);
+                        details.Add(d);
+                        if (connIdx[k] > 0)
+                        {
+                            connTouched[k] = true;
+                            string got = SetConnDesignation(fn, connIdx[k], iNewConn[i]);
+                            d["connectionAfter"] = got;
+                            if (got != iNewConn[i])
+                                throw new Exception("Item " + i + ": connection designation read back '" + got +
+                                    "', requested '" + iNewConn[i] + "'.");
+                        }
+                        nameTouched[k] = true;
+                        string route = SetFunctionName(fn, wantName[k]);
+                        string after = PropText(fn, "Name");
+                        if (after == null) after = "";
+                        string wantSuffix = wantName[k].Substring(newDt[k].Length);
+                        if (wantSuffix.Length > 1
+                            && string.Equals(DtPart(after), newDt[k], StringComparison.OrdinalIgnoreCase)
+                            && after.Substring(DtPart(after).Length) != wantSuffix)
+                        {
+                            object props2 = FnProps(fn);
+                            if (GetPropInfo(props2.GetType(), "FUNC_ADDITIONALIDENTIFYINGNAMEPART") != null)
+                            {
+                                route += " + FUNC_ADDITIONALIDENTIFYINGNAMEPART " +
+                                    SetLiveProp(props2, "FUNC_ADDITIONALIDENTIFYINGNAMEPART", wantSuffix.Substring(1));
+                                after = PropText(fn, "Name");
+                                if (after == null) after = "";
+                            }
+                        }
+                        d["route"] = route;
+                        d["name"] = after;
+                        d["visibleName"] = PropText(fn, "VisibleName");
+                        bool exact = string.Equals(after, wantName[k], StringComparison.OrdinalIgnoreCase);
+                        bool dtOk = string.Equals(DtPart(after), newDt[k], StringComparison.OrdinalIgnoreCase);
+                        bool shortOk = string.Equals(ShortTag(DtPart(after)), ShortTag(newDt[k]), StringComparison.OrdinalIgnoreCase);
+                        d["verified"] = exact || dtOk || shortOk;
+                        if (!exact && dtOk) d["verifiedBy"] = "deviceTag";
+                        if (!exact && !dtOk && shortOk) d["verifiedBy"] = "shortTag";
+                        if (!exact && !dtOk && !shortOk)
+                            throw new Exception("Item " + i + ": EPLAN stored '" + after + "' for requested '" + wantName[k] + "'.");
+                        Dictionary<string, object> u = new Dictionary<string, object>();
+                        u["handle"] = tHandle[k];
+                        u["tag"] = DtPart(prevName[k]);
+                        if (connIdx[k] > 0)
+                        {
+                            u["connection"] = iNewConn[i];
+                            u["connection_designation"] = prevConn[k];
+                        }
+                        undo.Add(u);
+                        modified++;
+                    }
+                }
+                catch (Exception exW)
+                {
+                    results["failedAtItem"] = k < n ? tItem[k] : -1;
+                    results["modified"] = modified;
+                    if (rollback)
+                    {
+                        List<object> rb = new List<object>();
+                        for (int r = n - 1; r >= 0; r--)
+                        {
+                            if (!nameTouched[r] && !connTouched[r]) continue;
+                            Dictionary<string, object> rd = new Dictionary<string, object>();
+                            rd["handle"] = tHandle[r];
+                            try
+                            {
+                                if (connTouched[r]) SetConnDesignation(tFn[r], connIdx[r], prevConn[r]);
+                                if (nameTouched[r]) SetFunctionName(tFn[r], prevName[r]);
+                                rd["name"] = PropText(tFn[r], "Name");
+                                rd["restored"] = string.Equals(PropText(tFn[r], "Name"), prevName[r], StringComparison.Ordinal);
+                            }
+                            catch (Exception exR)
+                            {
+                                rd["restored"] = false;
+                                rd["error"] = Flatten(exR);
+                            }
+                            rb.Add(rd);
+                        }
+                        results["rollback"] = rb;
+                        results["undo"] = new List<object>();
+                    }
+                    throw new Exception("Renaming stopped: " + Flatten(exW) + (rollback
+                        ? " - every change of this call was rolled back (see rollback)."
+                        : " - changes before this item stay written (see details / undo)."));
+                }
+                results["modified"] = modified;
+            }
+            results["success"] = true;
+'''
+
+
+def live_set_device_tags(items: list, allow_merge: bool = False, dry_run: bool = False,
+                         rollback_on_error: bool = True, allow_real_project: bool = False,
+                         timeout_seconds: float = 300.0) -> dict:
+    """
+    Set the device tag (BMK) of functions - also PLC connection points
+    (clrType Terminal), PLC boxes (PLC) and every other Function subclass -
+    one or many in ONE call. WRITES - scratch-only unless allow_real_project=True.
+
+    v5: e.g. 510K3:9..16 -> 510K4:1..8, or the
+    PLC box of an inserted ET 200SP macro K1 -> 510K3. Written to
+    FunctionBase.Name {get; set;} (API 2.9) - not to FUNC_IDENTDEVICETAG & co.,
+    which are computed (S063113).
+
+    Each item:
+        selector: "handle" (from live_read_function_properties / live_read_page)
+            or "name" (exact name, the device tag without ":x", or only the last
+            segment "510K3"), narrowed by "page" and "connection" (the CURRENT
+            connection point designation, e.g. "9"). Must match ONE function.
+        "tag": new device tag. Without '=' / '+' only the last segment is
+            replaced and the structure kept ("510K4" on "=AB-C+DI-510K3" ->
+            "=AB-C+DI-510K4"); with '=' or '+' it is the whole tag.
+        "connection_designation": optional new connection point designation
+            of that point (FUNC_CONNECTIONDESIGNATION[index]), e.g. "1".
+        "scope": "function" (default) or "device" = every function that
+            carries the target's device tag (box + all its points), each keeping
+            its own connection point.
+    Example: [{"name": "=AB-C+DI-510K3", "connection": "9", "page":
+    "=AB-C+DI/201", "tag": "510K4", "connection_designation": "1"}, ...]
+
+    Order: every item is resolved and checked BEFORE the first write (no match,
+    several matches, two items on one function, unknown connection point ->
+    nothing written). A new device tag that OTHER functions already carry
+    merges these functions into that device: refused unless allow_merge=True
+    ("merges" lists them). Each write is read back ("name", "verified"). On an
+    error everything this call wrote is rolled back (rollback_on_error) and
+    "rollback" reports it. "undo" holds the items that restore the previous
+    tags - pass it back as items. Not saved: on EPLAN's undo stack until the
+    project is saved.
+
+    Args:
+        items: list of items (see above), at most 500.
+        allow_merge: Permit new tags that already exist in the project.
+        dry_run: Resolve and plan only ("planned", "merges", "wouldRefuse");
+            nothing is written, so no allow_real_project needed.
+        rollback_on_error: Default True.
+        allow_real_project: Must be True to write outside the scratch root.
+        timeout_seconds: Default 300 (the project is walked once per call).
+
+    Returns:
+        {"success", "project", "dryRun", "functionsScanned", "planned":
+         [{"item", "handle", "page", "clrType", "previousName", "newName",
+         "connectionIndex", "previousConnection", "newConnection"}], "merges":
+         {tag: {"existingFunctions", "examples"}}, "details": [... + "name",
+         "visibleName", "route", "verified", "verifiedBy"], "modified",
+         "undo": [items], "rollback", "failedAtItem"}
+    """
+    try:
+        its = _tag_items(items)
+        timeout_seconds = float(timeout_seconds)
+    except SchematicValueError as exc:
+        return _err(exc)
+    except (TypeError, ValueError) as exc:
+        return _err(exc)
+
+    body = ("" if dry_run else _guard_prelude(allow_real_project)) + _fill(
+        _SET_TAGS_BODY,
+        DRYRUN=cs_bool(dry_run), ALLOWMERGE=cs_bool(allow_merge),
+        ROLLBACK=cs_bool(rollback_on_error),
+        IHANDLE=_cs_str_array([d["handle"] for d in its]),
+        INAME=_cs_str_array([d["name"] for d in its]),
+        IPAGE=_cs_str_array([d["page"] for d in its]),
+        ICONN=_cs_str_array([d["connection"] for d in its]),
+        ITAG=_cs_str_array([d["tag"] for d in its]),
+        INEWCONN=_cs_str_array([d["connection_designation"] for d in its]),
+        IDEVICE=_cs_bool_array([d["device"] for d in its]))
+    out = _shape_keep(_execute_script(
+        _script(_cls("SetTags"), body,
+                extra_helpers=_HELPERS_SCHEMATIC + _HELPERS_PROPS),
+        timeout=timeout_seconds,
+    ), keep=("details", "project", "planned", "merges", "undo", "rollback",
+             "failedAtItem", "modified", "dryRun"))
+    if out.get("success"):
+        if dry_run and out.get("wouldRefuse"):
+            out["note"] = ("Dry run: the write would be refused - %s already exist(s). "
+                           "Pass allow_merge=true if the merge is intended."
+                           % ", ".join(sorted(out.get("merges") or {})))
+        shorts = [d.get("handle") for d in out.get("details") or [] if d.get("verifiedBy") == "shortTag"]
+        if shorts:
+            out["warning"] = ("EPLAN stored a different structure than requested for %s - "
+                              "compare 'name' with 'newName'." % ", ".join(shorts))
     return out

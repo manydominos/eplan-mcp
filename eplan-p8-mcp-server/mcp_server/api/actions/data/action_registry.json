@@ -34352,6 +34352,31 @@
         "source": "docs"
       },
       {
+        "description": "Backup destination (EPLAN 2.9 documentation; required on 2.9 - without it: 'Storage medium expected. Parameter name: BACKUPMEDIA'). - \"EMAIL\": the project is sent by e-mail. - \"DISK\": the project is saved to a drive or similar storage.",
+        "name": "BACKUPMEDIA",
+        "source": "docs"
+      },
+      {
+        "description": "Maximum size in MB for splitting a packed (zipped) file to send it by e-mail (optional, 0 = no splitting). Ignored for BACKUPMEDIA DISK. Default = 0.0 (EPLAN 2.9 documentation).",
+        "name": "SPLITSIZE",
+        "source": "docs"
+      },
+      {
+        "description": "Scope of the backup (optional). - \"BACKUPAMOUNT_ALL\": the full project directory (default). - \"BACKUPAMOUNT_MIN\": only the database files needed to restore the project (EPLAN 2.9 documentation).",
+        "name": "BACKUPAMOUNT",
+        "source": "docs"
+      },
+      {
+        "description": "Compress the project database before the backup (optional, 0 = No, 1 = Yes). Default = 0 (EPLAN 2.9 documentation).",
+        "name": "COMPRESSPRJ",
+        "source": "docs"
+      },
+      {
+        "description": "Copy externally referenced files into the project's \\DOC subdirectory before the backup (optional, 0 = No, 1 = Yes). Default = 0. Only for TYPE PROJECT (EPLAN 2.9 name of AUTOCOPYREFDATA).",
+        "name": "COPYREFDATA",
+        "source": "docs"
+      },
+      {
         "description": "Type of master data to be backed up. - \"SYMBOLS\", - \"MACROS\", - \"FORMS\", - \"ARTICLES\", - \"LANGUAGES\", - \"STANDARDSHEET\", - \"STATIONDATA\"",
         "name": "MDTYPE",
         "source": "docs"

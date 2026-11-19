@@ -406,6 +406,65 @@ _HELPERS_SCHEMATIC = r'''
             ". Indices present: " + string.Join(", ", have.ToArray()) +
             ". Call live_read_page(include_pins=true) to see them.");
     }
+
+    // ---- v5: device tags of Function SUBCLASSES ------------------------------
+    // A PLC connection point is a Terminal, a PLC box a PLC: both derive from
+    // the object model class Function and carry a device tag (
+    // FunctionBase.Name is { get; set; } in API 2.9, Terminal/PLC inherit it).
+    static bool IsFunctionType(object o)
+    {
+        if (o == null) return false;
+        Type t = o.GetType();
+        while (t != null)
+        {
+            if (t.Name == "Function" && (t.Namespace == null || t.Namespace.StartsWith("Eplan.EplApi.DataModel")))
+                return true;
+            t = t.BaseType;
+        }
+        return false;
+    }
+
+    // "=AB-C+DI-510K3:9" -> "=AB-C+DI-510K3": the device tag without a
+    // ":designation" suffix after the last '-' (terminals, PLC points).
+    static string DtPart(string name)
+    {
+        if (name == null) return "";
+        int dash = name.LastIndexOf('-');
+        int colon = name.IndexOf(':', dash < 0 ? 0 : dash);
+        return colon < 0 ? name : name.Substring(0, colon);
+    }
+
+    // "=AB-C+DI-510K3" -> "510K3" (the last device tag segment).
+    static string ShortTag(string dt)
+    {
+        if (dt == null) return "";
+        int dash = dt.LastIndexOf('-');
+        return dash < 0 ? dt : dt.Substring(dash + 1);
+    }
+
+    // New device tag in the structure of the old one: "510K4" on
+    // "=AB-C+DI-510K3" -> "=AB-C+DI-510K4". A tag with '=' or '+' is taken whole.
+    static string ComposeDt(string oldDt, string tag)
+    {
+        if (tag.IndexOf('=') >= 0 || tag.IndexOf('+') >= 0) return tag;
+        int dash = oldDt == null ? -1 : oldDt.LastIndexOf('-');
+        string structure = dash < 0 ? "" : oldDt.Substring(0, dash);
+        return structure + "-" + tag.TrimStart('-');
+    }
+
+    // Name selector: the exact name, the device tag without ":x", or - for a
+    // selector without '=' / '+' - the last device tag segment ("510K3").
+    static bool NameMatches(string name, string sel)
+    {
+        if (sel == null || sel.Length == 0) return true;
+        if (name == null) return false;
+        if (name == sel) return true;
+        string dt = DtPart(name);
+        if (dt == sel) return true;
+        if (sel.IndexOf('=') < 0 && sel.IndexOf('+') < 0)
+            return string.Equals(ShortTag(dt), ShortTag(sel), StringComparison.OrdinalIgnoreCase);
+        return false;
+    }
 '''
 
 
@@ -774,7 +833,8 @@ def live_symbol_catalog(library: str = None, symbol: str = None,
 def live_create_page(plant: str = None, location: str = None, counter: int = 1,
                      page_type: str = "Circuit",
                      allow_real_project: bool = False,
-                     timeout_seconds: float = 90.0) -> dict:
+                     timeout_seconds: float = 90.0,
+                     description: str = None) -> dict:
     """
     Create a schematic page in the open project. WRITES - scratch-only by default.
 
@@ -787,14 +847,12 @@ def live_create_page(plant: str = None, location: str = None, counter: int = 1,
     Only name-forming properties can be set at creation time; that is EPLAN's
     own documented restriction on the property list Page.Create accepts.
 
-    There is deliberately NO `description` argument. PagePropertyList has no
-    page-description member - checked by reflection on 2027.0.1, which lists
-    only DESIGNATION_*_DESCR (descriptions OF a structure identifier) and
-    PAGE_CUSTOM_SUPPLEMENTARYFIELD01..100. Setting a description needs the
-    generic Property[AnyPropertyId] indexer and a decision about which property
-    id a "page description" is, which is a separate change rather than a guess
-    made here. Until then, a caller asking for one gets no argument to pass
-    rather than an argument that silently does nothing.
+    v5: `description` sets the page description - property #11011, which the
+    EPLAN 2.9 API names PagePropertyList.PAGE_NOMINATIOMN ("Page description",
+    sic). It is written AFTER Page.Create (that only accepts name-forming
+    properties) through a MultiLangString (SetAsString), so both plain text and
+    EPLAN's language form "sl_SI@WAGO 750 DI;en_US@PLC REFERENCES;" work, and
+    it is read back ("description", "descriptionVerified").
 
     Args:
         plant: Plant designation (the "=" part). Optional.
@@ -808,10 +866,16 @@ def live_create_page(plant: str = None, location: str = None, counter: int = 1,
         allow_real_project: Must be True to write to a project outside the
             scratch root. Default False - see the module docstring.
         timeout_seconds: Default 90s.
+        description: v5. Page description (#11011), plain text or
+            "sl_SI@Text;en_US@Text;". Omit for none.
 
     Returns:
         {"success", "page" (the actual name), "pageType", "gridSize", "size",
-         "handle", "undo": {"tool", "page"}, "page_after"}
+         "handle", "undo": {"tool", "page"}, "page_after"; with description
+         also "description" (as stored), "descriptionRoute",
+         "descriptionVerified"}. If the page was created but the description
+        could not be set, success is false and "page" / "pageCreated" / "undo"
+        say which page to remove.
 
         "gridSize" is the coordinate quantum for later placements - 3.175mm
         (one eighth inch) on the reference installation. Placing off-grid tends
@@ -822,6 +886,7 @@ def live_create_page(plant: str = None, location: str = None, counter: int = 1,
         page_type = cs_text(page_type, "page_type")
         plant_cs = cs_escape(cs_text(plant, "plant")) if plant else None
         loc_cs = cs_escape(cs_text(location, "location")) if location else None
+        descr = cs_text(description, "description") if description is not None else None
     except SchematicValueError as exc:
         return _err(exc)
 
@@ -886,6 +951,12 @@ def live_create_page(plant: str = None, location: str = None, counter: int = 1,
             results["page_after"] = ReadPage(page, 50, false, null);
 '''
     body = _fill(body, PAGETYPE='"%s"' % cs_escape(page_type))
+    if descr is not None:
+        # Filled on its own and spliced in afterwards, so the description text
+        # is never re-scanned for template tokens (see _fill).
+        body = body.replace(_PAGE_AFTER_LINE,
+                            _fill(_PAGE_DESCRIPTION_BLOCK, DESCR='"%s"' % cs_escape(descr))
+                            + _PAGE_AFTER_LINE, 1)
 
     raw = _execute_script(
         _script(_cls("MkPage"), body, extra_helpers=_HELPERS_SCHEMATIC),
@@ -898,7 +969,91 @@ def live_create_page(plant: str = None, location: str = None, counter: int = 1,
         if page_type not in COMMON_PAGE_TYPES:
             out["note"] = ("page_type %r is outside the common set; it was accepted "
                            "by the live enum." % page_type)
+        if descr is not None:
+            out["descriptionVerified"] = _description_matches(descr, out.get("description"))
+            if not out["descriptionVerified"]:
+                out["warning"] = ("Page description read back as %r, requested %r."
+                                  % (out.get("description"), descr))
+    elif not out.get("success"):
+        # v5: the page may exist although the description failed - say which.
+        inner = raw.get("results") if isinstance(raw, dict) else None
+        if isinstance(inner, dict) and inner.get("page"):
+            out["page"] = inner["page"]
+            out["pageCreated"] = True
+            out["undo"] = {"tool": "eplan_live_remove_placement",
+                           "page": inner["page"], "remove_page": True}
     return out
+
+
+# v5: the line before which the description block is spliced.
+_PAGE_AFTER_LINE = '            results["page_after"] = ReadPage(page, 50, false, null);\n'
+
+# v5: page description = PagePropertyList.PAGE_NOMINATIOMN (#11011, "Page
+# description" in API 2.9). Set through the LIVE page property list after
+# Page.Create; MultiLangString.SetAsString parses "sl_SI@x;en_US@y;" and
+# prefixes plain text language-neutral.
+_PAGE_DESCRIPTION_BLOCK = '''            {
+                object pprops = RequireReadable(page.GetType(), "Properties").GetValue(page, null);
+                if (pprops == null)
+                    throw new Exception("Page created, but Page.Properties returned null - description not set.");
+                PropertyInfo dpi = GetReadable(pprops.GetType(), "PAGE_NOMINATIOMN");
+                if (dpi == null)
+                    throw new Exception("Page created, but its property list declares no PAGE_NOMINATIOMN " +
+                        "(#11011) - description not set. " + MemberList(pprops.GetType(), false));
+                object dpv = dpi.GetValue(pprops, null);
+                if (dpv == null)
+                    throw new Exception("Page created, but PAGE_NOMINATIOMN returned null - description not set.");
+                string droute;
+                MethodInfo setMls = MethodByShape(dpv.GetType(), "Set", new string[] { "MultiLangString" }, false);
+                if (setMls != null)
+                {
+                    Type mlsType = setMls.GetParameters()[0].ParameterType;
+                    object mls = Activator.CreateInstance(mlsType);
+                    Call(RequireMethod(mlsType, "SetAsString", new string[] { "String" }, false), mls,
+                        new object[] { DESCR });
+                    Call(setMls, dpv, new object[] { mls });
+                    droute = "PAGE_NOMINATIOMN getter+Set(MultiLangString.SetAsString)";
+                }
+                else
+                {
+                    Call(RequireMethod(dpv.GetType(), "Set", new string[] { "String" }, false), dpv,
+                        new object[] { DESCR });
+                    droute = "PAGE_NOMINATIOMN getter+Set(string)";
+                }
+                results["descriptionRoute"] = droute;
+                object pprops2 = RequireReadable(page.GetType(), "Properties").GetValue(page, null);
+                object dpv2 = GetReadable(pprops2.GetType(), "PAGE_NOMINATIOMN").GetValue(pprops2, null);
+                string got = "";
+                if (dpv2 != null)
+                {
+                    bool empty = false;
+                    try
+                    {
+                        PropertyInfo ie = GetPropInfo(dpv2.GetType(), "IsEmpty");
+                        if (ie != null) empty = (bool)ie.GetValue(dpv2, null);
+                    }
+                    catch { }
+                    if (!empty) { string s = SafeText(dpv2); got = s == null ? "" : s; }
+                }
+                results["description"] = got;
+            }
+'''
+
+
+def _description_matches(requested, stored):
+    """v5: does the read-back page description say what was requested?"""
+    from .live_props import multilang_display
+    if stored is None:
+        return False
+    if stored == requested:
+        return True
+    want_disp, want_lang = multilang_display(requested)
+    got_disp, got_lang = multilang_display(stored)
+    if got_disp is None:
+        return False
+    if want_lang:
+        return all(got_lang.get(k) == v for k, v in want_lang.items())
+    return got_disp == requested
 
 
 # ---------------------------------------------------------------------------
@@ -1589,6 +1744,13 @@ def live_set_device_tag(page: str, handle: str, tag: str,
     accident it silently rewires the schematic. So the safe reading is the
     default and the useful one is opt-in.
 
+    v5: also PLC connection points (clrType Terminal), PLC boxes (PLC) and
+    every other Function subclass - all inherit FunctionBase.Name {get; set;}
+    (API 2.9). The tag is written VERBATIM, so for a PLC point give the full
+    name incl. structure (and ":designation" if the stored name has one; see
+    "previousName"). For many points, or to keep structure and connection
+    designation automatically, use live_set_device_tags.
+
     Args:
         page: Page the function is on.
         handle: Handle from live_place_symbol or live_read_page. Session-scoped.
@@ -1602,8 +1764,9 @@ def live_set_device_tag(page: str, handle: str, tag: str,
         timeout_seconds: Default 90s.
 
     Returns:
-        {"success", "page", "handle", "requestedTag", "name" (as EPLAN stored
-         it), "merged", "route", "placement", "page_after"}
+        {"success", "page", "handle", "clrType", "previousName" (v5, for the
+         undo), "requestedTag", "name" (as EPLAN stored it), "merged",
+         "route", "placement", "page_after"}
 
         "route" names which write path succeeded, so the first live run on a new
         EPLAN version documents itself instead of leaving you guessing.
@@ -1618,9 +1781,13 @@ def live_set_device_tag(page: str, handle: str, tag: str,
     body = _guard_prelude(allow_real_project) + '''
             object page = FindPage(project, PAGENAME);
             object target = ResolveOnPage(page, HANDLE);
-            if (target.GetType().Name != "Function")
-                throw new Exception("Only a Function can carry a device tag; " +
-                    "handle resolves to a " + target.GetType().Name + ".");
+            // v5: Terminal (PLC connection point), PLC (PLC box), BlackBox ...
+            // are Function SUBCLASSES and carry a device tag too.
+            if (!IsFunctionType(target))
+                throw new Exception("Only a Function (or a Function subclass such as Terminal or PLC) " +
+                    "can carry a device tag; handle resolves to a " + target.GetType().Name + ".");
+            results["clrType"] = target.GetType().Name;
+            results["previousName"] = PropText(target, "Name");
 
             // A tag already in use MERGES this function into that device as a
             // further sub-function. Correct for a coil + its contacts, wrong for
@@ -1629,10 +1796,10 @@ def live_set_device_tag(page: str, handle: str, tag: str,
             List<string> clash = new List<string>();
             foreach (object pl in PagePlacements(page))
             {
-                if (pl == null || pl.GetType().Name != "Function") continue;
+                if (pl == null || !IsFunctionType(pl)) continue;
                 if (Handle(pl) == HANDLE) continue;
                 string n = PropText(pl, "Name");
-                if (n != null && n == TAG) clash.Add(Handle(pl));
+                if (n != null && (n == TAG || DtPart(n) == TAG)) clash.Add(Handle(pl));
             }
             results["merged"] = clash.Count > 0;
             if (clash.Count > 0 && !allowMerge)
@@ -1672,7 +1839,9 @@ def live_set_device_tag(page: str, handle: str, tag: str,
             results["name"] = PropText(target, "Name");
             results["visibleName"] = PropText(target, "VisibleName");
             results["placement"] = DumpPlacement(target, false);
-            results["page_after"] = ReadPage(page, 200, false, new string[] { "Function" });
+            string tn = target.GetType().Name;
+            results["page_after"] = ReadPage(page, 200, false,
+                tn == "Function" ? new string[] { "Function" } : new string[] { "Function", tn });
 '''
     body = _fill(
         body,

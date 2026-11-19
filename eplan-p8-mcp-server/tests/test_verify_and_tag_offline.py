@@ -205,8 +205,11 @@ def test_set_tag_can_opt_into_the_merge(capture):
 
 
 def test_set_tag_only_accepts_a_function(capture):
+    """v5: a Function or a Function SUBCLASS (Terminal = PLC connection point,
+    PLC = PLC box) - v4 refused the subclasses."""
     S.live_set_device_tag("P", "h", "-K1")
-    assert 'target.GetType().Name != "Function"' in capture["cs"]
+    assert 'target.GetType().Name != "Function"' not in capture["cs"]
+    assert "if (!IsFunctionType(target))" in capture["cs"]
 
 
 def test_set_tag_reads_the_stored_name_back(capture):
