@@ -459,6 +459,43 @@ from .schematic import (
     live_place_connected,
 )
 
+# Many placements in one call: remove / move a macro, a device, a list of
+# handles or a rectangle. Writes are scratch-only unless allow_real_project.
+from .live_placements import (
+    live_remove_placements,
+    live_move_placements,
+)
+
+# Function properties (PLC data, function text, articles, property texts on the
+# sheet), device tags of PLC points and boxes, window macros and texts - by
+# handle, name or connection point. Writes are scratch-only unless allow_real_project.
+from .live_props import (
+    live_read_function_properties,
+    live_set_function_properties,
+    live_insert_window_macro,
+    live_set_device_tags,
+    live_place_function_property,
+    live_add_function_articles,
+    live_hide_function_property,
+    live_set_texts,
+)
+
+# Copy / paste between projects and batch editing after the copy: pages,
+# objects, macros, device tags, function definition, articles, symbol variant,
+# compact listing and checks. Writes are scratch-only unless allow_real_project.
+from .live_copy import (
+    live_copy_pages,
+    live_copy_objects,
+    live_save_macro,
+    live_insert_page_macro,
+    live_rename_devices,
+    live_set_function_definition,
+    live_remove_function_articles,
+    live_set_symbol_variant,
+    live_list_functions,
+    live_check_connections,
+)
+
 # Convention profiles - learn how a go-by project builds schematics, so
 # generated work matches the house (and the client) standard. Profiles are
 # stored OUTSIDE the repo: a client's conventions are customer data.
@@ -654,6 +691,14 @@ __all__ = [
     'live_read_terminals',
     'live_connect_pins_routed', 'live_routing_catalog', 'live_place_connection_symbol',
     'live_place_corner', 'live_place_tnode', 'live_place_connected',
+    # many placements, function properties, copy / paste
+    'live_remove_placements', 'live_move_placements',
+    'live_read_function_properties', 'live_set_function_properties',
+    'live_insert_window_macro', 'live_set_device_tags', 'live_place_function_property',
+    'live_add_function_articles', 'live_hide_function_property', 'live_set_texts',
+    'live_copy_pages', 'live_copy_objects', 'live_save_macro', 'live_insert_page_macro',
+    'live_rename_devices', 'live_set_function_definition', 'live_remove_function_articles',
+    'live_set_symbol_variant', 'live_list_functions', 'live_check_connections',
     'profile_learn', 'profile_list', 'profile_get', 'profile_suggest',
     'profile_forget',
     # New in EPLAN 2027

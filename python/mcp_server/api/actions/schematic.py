@@ -1356,7 +1356,11 @@ def _pin_point(side, index):
 # ---------------------------------------------------------------------------
 
 def live_read_page(page: str, include_pins: bool = True, limit: int = 200,
-                   types: list = None, timeout_seconds: float = 90.0) -> dict:
+                   types: list = None, timeout_seconds: float = 90.0,
+                   include_property_placements: bool = False,
+                   property_placements_limit: int = 50,
+                   include_text_content: bool = False,
+                   text_functions_limit: int = 5) -> dict:
     """
     Read one page's full state: every placement, its geometry and its pins.
 
@@ -1383,10 +1387,42 @@ def live_read_page(page: str, include_pins: bool = True, limit: int = 200,
             `limit` is exhausted on graphics before a single device is reached,
             and the page looks empty.
         timeout_seconds: Default 90s.
+        include_property_placements: True: every symbol placement
+            (Function, PLC box, Terminal, ...) also gets
+            "propertyPlacements" - the texts that SHOW its properties
+            (device tag, PLC type designation FUNC_PLCTYPE_ID, technical
+            characteristics, rack/slot, ...), hidden ones included:
+            [{"handle", "propertyId", "propertyIndex", "propertyName",
+            "text" (as displayed), "displayText", "visible",
+            "setAsVisible" (Visible/Invisible/ByLayer), "isVisible",
+            "location", "boundingBox" {min, max}, "height",
+            "justification", "docked", "relation", "relationIndex"}] and
+            "useLocalPropertyPlacements". Use with types=["PLC"] or a small
+            limit - a terminal has several texts. Default False (output
+            unchanged). To show or hide one use live_place_function_property
+            / live_hide_function_property.
+        property_placements_limit: Max texts per symbol (default 50).
+        include_text_content: True: every Text and PathText (path function
+            text) also gets "textContent": {"kind" Text / PathText, "raw"
+            (MultiLangString "en_US@..;de_DE@..;", "??_??" = language
+            independent), "text" (first language), "byLanguage", "displayed"
+            (GetDisplayString), "location", "height", "justification",
+            "layer", "textColorId" (-16002 = from layer), "setAsVisible",
+            "rotation", "languageMode"}; a PathText also
+            "functionsShowingIt" [{handle, name, dx}] and
+            "functionsShowingItCount": functions of this page with an EMPTY
+            FUNC_TEXT whose FUNC_TEXT_AUTOMATIC (#20031) shows the text,
+            nearest first (dx = x distance). Use types=["PathText"] or
+            ["Text", "PathText"]. Default False (output unchanged). To change
+            a text: live_set_texts.
+        text_functions_limit: Functions listed per path text (default 5,
+            0 = do not look for them).
 
     Returns:
         {"success", "page", "pageType", "gridSize", "size", "placementCount",
          "returned", "truncated", "placements": [...]}
+        (+ "propertyPlacementCount", "placementsWithPropertyPlacements" with
+        include_property_placements).
 
         Each placement: {"clrType", "handle", "name", "location",
         "boundingBox", "symbol", "pins", "absentMembers"}.
@@ -1403,6 +1439,8 @@ def live_read_page(page: str, include_pins: bool = True, limit: int = 200,
     try:
         page_cs = cs_escape(cs_text(page, "page"))
         limit = cs_int(limit, "limit", minimum=1, maximum=5000)
+        pp_max = cs_int(property_placements_limit, "property_placements_limit", minimum=1, maximum=500)
+        tf_max = cs_int(text_functions_limit, "text_functions_limit", minimum=0, maximum=100)
         if types is not None:
             if isinstance(types, str):
                 types = [types]
@@ -1427,13 +1465,30 @@ def live_read_page(page: str, include_pins: bool = True, limit: int = 200,
         ONLYTYPES=only,
         WITHPINS=cs_bool(include_pins),
     )
+    helpers = _HELPERS_SCHEMATIC
+    if include_property_placements or include_text_content:
+        # Lazy: live_placements and live_props import this module.
+        from . import live_placements as _lpl
+        helpers = _lpl._HELPERS_SCHEMATIC_X
+        if include_property_placements:
+            body += _fill(_lpl._READ_PP_BODY, V8PPMAX=str(pp_max))
+        if include_text_content:
+            from .live_props import _HELPERS_PROPS, _HELPERS_V10, _READ_TEXT_BODY
+            body += _fill(_READ_TEXT_BODY, V10FMAX=str(tf_max))
+            helpers = helpers + _HELPERS_PROPS + _HELPERS_V10
 
     out = _shape(_execute_script(
-        _script(_cls("ReadPage"), body, extra_helpers=_HELPERS_SCHEMATIC),
+        _script(_cls("ReadPage"), body, extra_helpers=helpers),
         timeout=timeout_seconds,
     ))
     if out.get("success"):
         _annotate_pins(out)
+        if include_property_placements or include_text_content:
+            from . import live_placements as _lpl
+            if include_property_placements:
+                _lpl._pp_display(out)
+            if include_text_content:
+                _lpl._text_display(out)
     return out
 
 

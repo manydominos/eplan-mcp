@@ -39,7 +39,7 @@ Use one of these whenever you are unsure of an exact action name or parameter â€
 
 ## 2. The local `eplan` action server
 
-It exposes **282 tools** (full tool-by-tool reference: [covaga.dev/docs/tools](https://covaga.dev/docs/tools/project-and-workspace-management/)):
+It exposes **302 tools** (full tool-by-tool reference: [covaga.dev/docs/tools](https://covaga.dev/docs/tools/project-and-workspace-management/)):
 
 - **7 script-host tools** (`eplan_script_hello`, `eplan_script_run`,
   `eplan_script_status`, `eplan_script_cancel`, `eplan_script_list`,
@@ -197,6 +197,29 @@ It exposes **282 tools** (full tool-by-tool reference: [covaga.dev/docs/tools](h
   connection symbols, including two different `TNodeUp` symbols and five
   same-direction `TLRU` variants whose pins sit in different places, so these
   tools refuse to guess between rivals and report the geometry instead),
+  20 tools for editing existing schematics in bulk, on the same scaffold
+  (scratch-only writes, verified read-back, written against EPLAN 2.9's
+  object model): `eplan_live_remove_placements` / `eplan_live_move_placements`
+  (a whole macro, a device, a list of handles or a rectangle in one call;
+  dry run first), `eplan_live_read_function_properties` /
+  `eplan_live_set_function_properties` (PLC address, channel, function text,
+  any FunctionPropertyList value, article swap - selected by handle, name or
+  connection point, many functions per call), `eplan_live_set_device_tags`
+  (device tags of PLC connection points, PLC boxes and every other function,
+  bulk, rolled back on error), `eplan_live_insert_window_macro` (reports which
+  existing functions the macro merged with), `eplan_live_place_function_property`
+  / `eplan_live_hide_function_property` (show or hide a property text on a
+  symbol), `eplan_live_add_function_articles` /
+  `eplan_live_remove_function_articles` (article references, parts database
+  checked first without opening it), `eplan_live_set_texts` (Text and path
+  function text contents), the copy / paste set `eplan_live_copy_pages` (pages
+  of an open or closed project into another, page names and device tags by
+  rule), `eplan_live_copy_objects`, `eplan_live_save_macro`,
+  `eplan_live_insert_page_macro`, and the after-copy fixes
+  `eplan_live_rename_devices`, `eplan_live_set_function_definition`,
+  `eplan_live_set_symbol_variant`, `eplan_live_list_functions` (a compact
+  table) and `eplan_live_check_connections` (duplicates, PLC points without a
+  card channel, symbols without connections),
   and 5 convention-profile tools
   (`eplan_profile_learn`, `eplan_profile_list`, `eplan_profile_get`,
   `eplan_profile_suggest`, `eplan_profile_forget`) that learn how a GO-BY

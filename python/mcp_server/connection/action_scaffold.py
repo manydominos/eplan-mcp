@@ -8,7 +8,7 @@ import uuid
 from typing import Optional
 
 from cs_json import prepare_script
-from connection.logs import logger
+from connection.logs import WORK_ROOT, logger
 from connection.shaping import MESSAGE_SCAN_CAP, carry_hang_note
 
 
@@ -102,7 +102,8 @@ class ScaffoldMixin:
                 params[key] = val
 
             # Generate directories
-            base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+            # In the local TEMP, never in the code folder (connection.logs.WORK_ROOT).
+            base_dir = WORK_ROOT
             script_dir = os.path.join(base_dir, "scripts", "generated")
             results_dir = os.path.join(base_dir, "scripts", "results")
             os.makedirs(script_dir, exist_ok=True)

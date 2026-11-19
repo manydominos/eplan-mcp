@@ -178,7 +178,8 @@ def test_quiet_mode_generated_script_cleaned_up():
     is supposed to be checking. Reproduced deterministically by touching
     `scripts/generated/exec_action_deadbeef.cs` before running it.
     """
-    base = os.path.dirname(os.path.abspath(eplan_connection.__file__))
+    # The wrapper writes into the local TEMP work folder, not the code folder.
+    from connection.logs import WORK_ROOT as base
     gen_dir = os.path.join(base, "scripts", "generated")
     res_dir = os.path.join(base, "scripts", "results")
 

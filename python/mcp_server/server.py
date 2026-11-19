@@ -302,7 +302,9 @@ def eplan_test(show_dialog: bool = False) -> str:
 
     if show_dialog:
         # Create test script
-        scripts_dir = os.path.join(SCRIPT_DIR, "scripts")
+        # In the local TEMP work folder, never in the code folder.
+        from connection.logs import WORK_ROOT
+        scripts_dir = os.path.join(WORK_ROOT, "scripts")
         os.makedirs(scripts_dir, exist_ok=True)
         script_path = os.path.join(scripts_dir, "mcp_test.cs")
 
