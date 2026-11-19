@@ -41,6 +41,10 @@ def pytest_configure(config):
         "live: needs a running EPLAN on the remote-control channel; "
         "skips itself when none answers",
     )
+    config.addinivalue_line(
+        "markers",
+        "parts_guard: keep the v4 parts-database preflight ON for this test",
+    )
 
 
 @pytest.fixture(autouse=True)
@@ -61,3 +65,20 @@ def _isolate_action_log(tmp_path, monkeypatch):
     to be thinking about logging at all.
     """
     monkeypatch.setenv("EPLAN_MCP_LOG_DIR", str(tmp_path / "logs"))
+
+
+@pytest.fixture(autouse=True)
+def _parts_db_guard_off(request, monkeypatch):
+    """v4: every parts_db_* tool first runs a preflight script (is the parts
+    database openable without a modal dialog?). The older tests capture the ONE
+    script a tool generates, so for them the preflight is switched off here;
+    tests marked `parts_guard` (test_parts_db_guard_offline.py) keep it on.
+    """
+    if request.node.get_closest_marker("parts_guard"):
+        return
+    try:
+        from api.actions import scripted
+    except Exception:  # pragma: no cover - collection of unrelated tests
+        return
+    monkeypatch.setattr(scripted, "_parts_db_guard",
+                        lambda allow_unverified_db=False: None)

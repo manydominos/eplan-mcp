@@ -3,6 +3,8 @@ EPLAN MCP Server
 
 Complete EPLAN automation server exposing all API actions via MCP protocol.
 Every action runs inside a C# script under QuietMode (no blocking dialogs).
+v4: every tool runs on a worker thread with one EPLAN lock and a deadline
+(call_guard.py), so one call stuck in EPLAN cannot freeze the server.
 
 Two registration modes, selected with EPLAN_MCP_MODE:
   full       (default) - every wrapper is its own MCP tool. Unchanged behaviour.
@@ -33,6 +35,7 @@ sys.path.insert(0, os.path.join(SCRIPT_DIR, "api"))
 import api.actions as eplan_actions
 from api.actions import _project_cache
 from tool_registry import ToolRegistry, make_meta_tools, META_TOOL_NAMES
+import call_guard
 
 
 # ============================================================================
@@ -116,7 +119,12 @@ def _json_wrapper(f):
 def eplan_status() -> str:
     """Get the current EPLAN connection status."""
     manager = get_manager()
-    return json.dumps(manager.get_status(), indent=2)
+    status = manager.get_status()
+    # v4: which EPLAN call is running (and whether it already timed out).
+    busy = call_guard.busy_info()
+    if busy:
+        status["eplanBusy"] = busy
+    return json.dumps(status, indent=2)
 
 
 def eplan_versions() -> str:
@@ -338,7 +346,8 @@ def _register_core(app, registry, mode):
         if published:
             # Registered raw (not through _json_wrapper): these already return
             # a JSON string, exactly as they did when they were decorated.
-            app.tool(name=tool_name)(func)
+            # v4: on a worker thread (call_guard) - same name, schema, doc.
+            app.tool(name=tool_name)(call_guard.guarded(func, tool_name))
 
 
 # ============================================================================
@@ -376,7 +385,7 @@ def register_actions(actions_module, prefix="eplan_", app=None, registry=None, m
                          published=published)
 
         if published and app is not None:
-            app.tool(name=tool_name)(_json_wrapper(func))
+            app.tool(name=tool_name)(call_guard.guarded(_json_wrapper(func), tool_name))
 
 
 # ============================================================================
@@ -487,7 +496,7 @@ def build_app(mode="full", app=None, registry=None):
         for attr, func in meta.items():
             tool_name = "eplan_" + attr
             registry.add(tool_name, meta_ns, attr, prefix="eplan_", published=True)
-            app.tool(name=tool_name)(_json_wrapper(func))
+            app.tool(name=tool_name)(call_guard.guarded(_json_wrapper(func), tool_name))
 
     strip_schema_boilerplate(app)
 

@@ -328,6 +328,36 @@ _HELPERS_PROPS = r'''
         return true;
     }
 
+    // v4: PLC boxes, terminals, black boxes ... are SUBCLASSES of Function
+    // (clrType "PLC", "Terminal"); comparing GetType().Name with "Function"
+    // missed all of them (window macro: functionNames []).
+    static bool IsFunctionObject(object o)
+    {
+        Type t = o.GetType();
+        while (t != null)
+        {
+            if (t.Name == "Function" && (t.Namespace == null || t.Namespace.StartsWith("Eplan.EplApi.DataModel")))
+                return true;
+            t = t.BaseType;
+        }
+        return false;
+    }
+
+    // v4: pure graphics (lines, arcs, ...) of an inserted macro.
+    static bool IsGraphicObject(object o)
+    {
+        Type t = o.GetType();
+        string ns = t.Namespace == null ? "" : t.Namespace;
+        if (ns.EndsWith(".Graphics")) return true;
+        switch (t.Name)
+        {
+            case "Line": case "Arc": case "Circle": case "Polyline": case "PolyLine":
+            case "Rectangle": case "Ellipse": case "Hatch": case "Image":
+                return true;
+        }
+        return false;
+    }
+
     static Dictionary<string, object> DescribeFn(object fn, string[] pNames, int[] pIdx,
                                                  bool withArticles, List<string> unknown)
     {
@@ -348,14 +378,28 @@ _HELPERS_PROPS = r'''
         object props = FnProps(fn);
         d["connectionDesignations"] = ConnDesignations(props);
         Dictionary<string, object> pv = new Dictionary<string, object>();
+        List<string> notApplicable = new List<string>();
         for (int i = 0; i < pNames.Length; i++)
         {
             string key = pIdx[i] > 0 ? pNames[i] + "[" + pIdx[i] + "]" : pNames[i];
             string t;
-            if (ReadFnProp(props, pNames[i], pIdx[i], out t)) pv[key] = t;
+            if (ReadFnProp(props, pNames[i], pIdx[i], out t))
+            {
+                // v4: declared by the property list but not valid for THIS
+                // function (PLC properties on a coil or contact). Not a value
+                // and not an error: null + listed in notApplicable.
+                if (t != null && t.StartsWith("<error:")
+                    && t.IndexOf("PropertyNotFoundException", StringComparison.Ordinal) >= 0)
+                {
+                    pv[key] = null;
+                    notApplicable.Add(key);
+                }
+                else pv[key] = t;
+            }
             else if (!unknown.Contains(key)) unknown.Add(key);
         }
         d["properties"] = pv;
+        if (notApplicable.Count > 0) d["notApplicable"] = notApplicable;
         if (withArticles) d["articles"] = Articles(fn, absent);
         if (absent.Count > 0) d["absentMembers"] = absent;
         return d;
@@ -471,6 +515,13 @@ def live_read_function_properties(name: str = None, contains: str = None, page: 
     ))
     if out.get("success"):
         _add_display_texts(out.get("functions"))
+        na = {}
+        for fn in out.get("functions") or []:
+            for key in fn.get("notApplicable") or []:
+                na[key] = na.get(key, 0) + 1
+        if na:
+            # v4: {property: number of returned functions it does not apply to}
+            out["notApplicableProperties"] = na
         if not out.get("matched"):
             out["note"] = ("No function matched. Names are exact device tags incl. "
                            "structure (=..+..-..); use contains= or live_query_functions "
@@ -481,6 +532,26 @@ def live_read_function_properties(name: str = None, contains: str = None, page: 
 # ---------------------------------------------------------------------------
 # M-6  write
 # ---------------------------------------------------------------------------
+
+def _verify_by_display_text(details):
+    """
+    v4: EPLAN stores FUNC_TEXT as a MultiLangString ("??_??@TEST v3;"), so the
+    exact read-back never equals the requested "TEST v3". When the display
+    text equals the request, the write is verified (verifiedBy "displayText").
+    """
+    for d in details or []:
+        for p in d.get("properties") or []:
+            if p.get("verified"):
+                continue
+            requested = p.get("requested")
+            disp, by_lang = multilang_display(p.get("new"))
+            if disp is None or requested is None:
+                continue
+            if requested == disp or requested in (by_lang or {}).values():
+                p["verified"] = True
+                p["verifiedBy"] = "displayText"
+                p["newDisplay"] = disp
+
 
 def live_set_function_properties(values: dict = None, name: str = None, handle: str = None,
                                  page: str = None, connection_designation: str = None,
@@ -695,6 +766,7 @@ def live_set_function_properties(values: dict = None, name: str = None, handle: 
         timeout=timeout_seconds,
     ))
     if out.get("success"):
+        _verify_by_display_text(out.get("details"))
         bad = [p["property"] for d in out.get("details") or []
                for p in d.get("properties") or [] if not p.get("verified")]
         art_bad = [d.get("name") for d in out.get("details") or []
@@ -715,7 +787,8 @@ def live_set_function_properties(values: dict = None, name: str = None, handle: 
 def live_insert_window_macro(page: str, macro_path: str, x: float, y: float,
                              variant: int = 0, move_kind: str = "absolute",
                              allow_real_project: bool = False,
-                             timeout_seconds: float = 120.0) -> dict:
+                             timeout_seconds: float = 120.0,
+                             include_graphics: bool = False) -> dict:
     """
     Insert a window macro (.ema) on a page at a coordinate. WRITES -
     scratch-only unless allow_real_project=True.
@@ -739,12 +812,19 @@ def live_insert_window_macro(page: str, macro_path: str, x: float, y: float,
         move_kind: "absolute" (default) or "relative" (Insert.MoveKind).
         allow_real_project: Must be True to write outside the scratch root.
         timeout_seconds: Default 120.
+        include_graphics: v4. False (default) lists only non-graphic objects in
+            "inserted" (functions, PLC boxes, terminals, ...) and counts the
+            graphics (lines, arcs, ...) in "graphicsOmitted"; True lists all.
 
     Returns:
         {"success", "project", "page", "pageType", "boundSignature",
-         "insertedCount", "inserted": [placement as in live_read_page],
-         "functionNames", "duplicateNames": {name: count elsewhere},
-         "placementsBefore", "placementsAfter", "warning"}
+         "insertedCount" (all objects), "listedCount", "inserted": [placement
+         as in live_read_page], "graphicsOmitted": {type: count},
+         "functionNames" (every inserted Function incl. PLC boxes and
+         terminals), "duplicateNames": {name: count of functions that existed
+         BEFORE the insert and now carry that name}, "renamedExisting":
+         [{"handle", "nameBefore", "nameAfter"}] (existing functions renamed by
+         the merge), "placementsBefore", "placementsAfter", "warning"}
     """
     try:
         page_cs = cs_escape(cs_text(page, "page"))
@@ -768,6 +848,18 @@ def live_insert_window_macro(page: str, macro_path: str, x: float, y: float,
             object page = FindPage(project, PAGENAME);
             results["page"] = PropText(page, "Name");
             results["pageType"] = PropText(page, "PageType");
+
+            // v4: names of all functions BEFORE the insert, by handle - a merge
+            // can rename an existing function (=+-K1 -> =CA1+EAA-K1).
+            Dictionary<string, string> namesBefore = new Dictionary<string, string>();
+            foreach (object fn0 in AllFunctions(project))
+            {
+                if (fn0 == null) continue;
+                string h0 = Handle(fn0);
+                if (h0 == null || namesBefore.ContainsKey(h0)) continue;
+                string n0 = PropText(fn0, "Name");
+                namesBefore[h0] = n0 == null ? "" : n0;
+            }
             int before = 0;
             foreach (object pl in PagePlacements(page)) if (pl != null) before++;
             results["placementsBefore"] = before;
@@ -798,15 +890,28 @@ def live_insert_window_macro(page: str, macro_path: str, x: float, y: float,
             List<object> placed = new List<object>();
             List<string> fnNames = new List<string>();
             List<string> fnHandles = new List<string>();
+            Dictionary<string, object> graphics = new Dictionary<string, object>();
+            bool withGraphics = WITHGRAPHICS;
+            int total = 0;
             if (ret is IEnumerable)
             {
                 foreach (object o in (IEnumerable)ret)
                 {
                     if (o == null) continue;
-                    Dictionary<string, object> pd = DumpPlacement(o, false);
-                    pd["page"] = FnPageName(o);
-                    placed.Add(pd);
-                    if (o.GetType().Name == "Function")
+                    total++;
+                    bool graphic = IsGraphicObject(o);
+                    if (graphic)
+                    {
+                        string gt = o.GetType().Name;
+                        graphics[gt] = graphics.ContainsKey(gt) ? (int)graphics[gt] + 1 : 1;
+                    }
+                    if (!graphic || withGraphics)
+                    {
+                        Dictionary<string, object> pd = DumpPlacement(o, false);
+                        pd["page"] = FnPageName(o);
+                        placed.Add(pd);
+                    }
+                    if (IsFunctionObject(o))
                     {
                         string n = PropText(o, "Name");
                         if (n != null && n.Length > 0 && !fnNames.Contains(n)) fnNames.Add(n);
@@ -815,22 +920,39 @@ def live_insert_window_macro(page: str, macro_path: str, x: float, y: float,
                 }
             }
             results["inserted"] = placed;
-            results["insertedCount"] = placed.Count;
+            results["insertedCount"] = total;
+            results["listedCount"] = placed.Count;
+            if (!withGraphics) results["graphicsOmitted"] = graphics;
             results["functionNames"] = fnNames;
 
+            // v4: a duplicate is a function that existed BEFORE the insert and
+            // now carries an inserted name (also when the merge renamed it).
             Dictionary<string, object> dup = new Dictionary<string, object>();
+            List<object> renamed = new List<object>();
             if (fnNames.Count > 0)
             {
                 foreach (object fn in AllFunctions(project))
                 {
                     if (fn == null) continue;
+                    string h = Handle(fn);
+                    if (h == null || fnHandles.Contains(h)) continue;
+                    string was;
+                    if (!namesBefore.TryGetValue(h, out was)) continue;
                     string n = PropText(fn, "Name");
                     if (n == null || !fnNames.Contains(n)) continue;
-                    if (fnHandles.Contains(Handle(fn))) continue;
                     dup[n] = dup.ContainsKey(n) ? (int)dup[n] + 1 : 1;
+                    if (was != n && renamed.Count < 50)
+                    {
+                        Dictionary<string, object> rd = new Dictionary<string, object>();
+                        rd["handle"] = h;
+                        rd["nameBefore"] = was;
+                        rd["nameAfter"] = n;
+                        renamed.Add(rd);
+                    }
                 }
             }
             results["duplicateNames"] = dup;
+            if (renamed.Count > 0) results["renamedExisting"] = renamed;
 
             int after = 0;
             foreach (object pl in PagePlacements(page)) if (pl != null) after++;
@@ -841,7 +963,7 @@ def live_insert_window_macro(page: str, macro_path: str, x: float, y: float,
                  PAGENAME='"%s"' % page_cs,
                  MACROPATH='"%s"' % cs_escape(path),
                  POSX=xs, POSY=ys, VARIANT=str(var),
-                 MOVEKIND='"%s"' % mk)
+                 MOVEKIND='"%s"' % mk, WITHGRAPHICS=cs_bool(include_graphics))
     out = _shape(_execute_script(
         _script(_cls("InsWinMacro"), body,
                 extra_helpers=_HELPERS_SCHEMATIC + _HELPERS_PROPS),

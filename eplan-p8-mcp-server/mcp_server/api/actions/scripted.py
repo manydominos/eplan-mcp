@@ -506,12 +506,46 @@ def _execute_script(script_content: str, timeout: float = 30.0) -> dict:
 # PARTS DATABASE (MDPartsManagement)
 # =============================================================================
 
+# v4 (inbox 2026-10-28_eplan_parts_db_blokira_streznik.md): on EPLAN 2.9 64-bit
+# without 64-bit Office/ACE, MDPartsManagement.OpenDatabase() makes EPLAN show
+# the MODAL "...ESS_part001.mdb database cannot be opened. Microsoft Office 64
+# bits is required..." - the script waits for a click and so did the server.
+# Every parts_db_* tool therefore first asks EPLAN which database is configured
+# and whether its provider is registered (parts_db_reflect.preflight_script,
+# which never touches MDPartsManagement) and refuses when it cannot be opened.
+_PARTS_DB_PREFLIGHT_TTL_S = 30.0
+_parts_db_preflight_cache = {"at": 0.0, "verdict": None}
+
+
+def _parts_db_preflight() -> dict:
+    """Verdict about the configured parts database (see parts_db_reflect.classify_parts_db)."""
+    from . import parts_db_reflect
+    now = time.time()
+    cached = _parts_db_preflight_cache.get("verdict")
+    if cached is not None and now - _parts_db_preflight_cache.get("at", 0.0) < _PARTS_DB_PREFLIGHT_TTL_S:
+        return cached
+    verdict = parts_db_reflect.classify_parts_db(
+        _execute_script(parts_db_reflect.preflight_script()))
+    # Only definitive answers are cached (a bulk import calls get_part per part).
+    if verdict.get("verdict") in ("ok", "unavailable"):
+        _parts_db_preflight_cache["at"] = now
+        _parts_db_preflight_cache["verdict"] = verdict
+    return verdict
+
+
+def _parts_db_guard(allow_unverified_db: bool = False):
+    """None = go ahead; otherwise the refusal to return instead of opening the DB."""
+    from . import parts_db_reflect
+    verdict = _parts_db_preflight()
+    return parts_db_reflect.guard_response(verdict, allow_unverified_db)
+
 
 def parts_db_query(
     filter_property: str = None,
     filter_value: str = None,
     return_properties: List[str] = None,
     limit: int = 100,
+    allow_unverified_db: bool = False,
 ) -> dict:
     """
     Query parts from the EPLAN parts database.
@@ -545,6 +579,13 @@ def parts_db_query(
         return_properties: List of properties to return (default: PartNr,
             Description1, Manufacturer, ProductGroup, ProductSubGroup).
         limit: Maximum number of parts to return
+        allow_unverified_db: v4. Before the database is opened, the configured
+            parts database and its provider are checked WITHOUT opening it. An
+            Access database (.mdb/.accdb) without a 64-bit Microsoft Access
+            Database Engine (ACE OLEDB 12.0/16.0) is always refused
+            (errorType PARTS_DB_UNAVAILABLE) - EPLAN would show a modal dialog
+            and block. If the check cannot decide (PARTS_DB_UNVERIFIED), True
+            tries anyway.
 
     Returns:
         dict with parts list and count
@@ -569,18 +610,30 @@ def parts_db_query(
         if not _CS_IDENTIFIER.match(filter_property):
             return _identifier_error(filter_property, "filter_property")
 
+    blocked = _parts_db_guard(allow_unverified_db)
+    if blocked:
+        return blocked
+
     from . import parts_db_reflect
     return _execute_script(parts_db_reflect.query_script(
         filter_property, filter_value, return_properties, limit))
 
 
-def parts_db_count(filter_property: str = None, filter_value: str = None) -> dict:
+def parts_db_count(filter_property: str = None, filter_value: str = None,
+                   allow_unverified_db: bool = False) -> dict:
     """
     Count parts in the EPLAN parts database.
 
     Args:
         filter_property: Property to filter on (a member of MDPart, e.g. "PartNr")
         filter_value: Value to match (substring, case-sensitive)
+        allow_unverified_db: v4. Before the database is opened, the configured
+            parts database and its provider are checked WITHOUT opening it. An
+            Access database (.mdb/.accdb) without a 64-bit Microsoft Access
+            Database Engine (ACE OLEDB 12.0/16.0) is always refused
+            (errorType PARTS_DB_UNAVAILABLE) - EPLAN would show a modal dialog
+            and block. If the check cannot decide (PARTS_DB_UNVERIFIED), True
+            tries anyway.
 
     Returns:
         dict with count
@@ -589,17 +642,28 @@ def parts_db_count(filter_property: str = None, filter_value: str = None) -> dic
         if not _CS_IDENTIFIER.match(filter_property):
             return _identifier_error(filter_property, "filter_property")
 
+    blocked = _parts_db_guard(allow_unverified_db)
+    if blocked:
+        return blocked
+
     from . import parts_db_reflect
     return _execute_script(parts_db_reflect.count_script(filter_property, filter_value))
 
 
-def parts_db_get_part(part_number: str) -> dict:
+def parts_db_get_part(part_number: str, allow_unverified_db: bool = False) -> dict:
     """
     Get detailed information about a specific part.
 
     Args:
         part_number: The part number to look up. Matched EXACTLY against
             MDPart.PartNr; use parts_db_query for substring search.
+        allow_unverified_db: v4. Before the database is opened, the configured
+            parts database and its provider are checked WITHOUT opening it. An
+            Access database (.mdb/.accdb) without a 64-bit Microsoft Access
+            Database Engine (ACE OLEDB 12.0/16.0) is always refused
+            (errorType PARTS_DB_UNAVAILABLE) - EPLAN would show a modal dialog
+            and block. If the check cannot decide (PARTS_DB_UNVERIFIED), True
+            tries anyway.
 
     Returns:
         dict with "found" and, when found, "part" carrying PartNr, the three
@@ -611,11 +675,16 @@ def parts_db_get_part(part_number: str) -> dict:
         member). The MasterData types are resolved by reflection (v3), so the
         script also compiles on EPLAN 2.9.
     """
+    blocked = _parts_db_guard(allow_unverified_db)
+    if blocked:
+        return blocked
+
     from . import parts_db_reflect
     return _execute_script(parts_db_reflect.get_part_script(part_number))
 
 
-def parts_db_create(part_number: str, properties: dict = None) -> dict:
+def parts_db_create(part_number: str, properties: dict = None,
+                    allow_unverified_db: bool = False) -> dict:
     """
     Create a new part in the parts database and optionally set properties.
 
@@ -628,10 +697,21 @@ def parts_db_create(part_number: str, properties: dict = None) -> dict:
         properties: Optional dict of raw parts-DB property names to string
             values, e.g. {"ARTICLE_MANUFACTURER": "Siemens",
             "ARTICLE_DESCR1": "Circuit breaker"}
+        allow_unverified_db: v4. Before the database is opened, the configured
+            parts database and its provider are checked WITHOUT opening it. An
+            Access database (.mdb/.accdb) without a 64-bit Microsoft Access
+            Database Engine (ACE OLEDB 12.0/16.0) is always refused
+            (errorType PARTS_DB_UNAVAILABLE) - EPLAN would show a modal dialog
+            and block. If the check cannot decide (PARTS_DB_UNVERIFIED), True
+            tries anyway.
 
     Returns:
         dict with success status and the properties that were set
     """
+    blocked = _parts_db_guard(allow_unverified_db)
+    if blocked:
+        return blocked
+
     part_number_cs = cs_escape(part_number)
     # Property names/values go into parallel C# string arrays (each element
     # cs_escape'd) and are applied at runtime via reflection with a single
@@ -718,7 +798,8 @@ public class PartsCreate_{uuid.uuid4().hex[:6]}
     return _execute_script(script)
 
 
-def parts_db_update(part_number: str, property_name: str, property_value: str) -> dict:
+def parts_db_update(part_number: str, property_name: str, property_value: str,
+                    allow_unverified_db: bool = False) -> dict:
     """
     Update a property on a part in the database.
 
@@ -726,10 +807,21 @@ def parts_db_update(part_number: str, property_name: str, property_value: str) -
         part_number: The part number to update
         property_name: Property to update (e.g., "ARTICLE_DESCR1")
         property_value: New value
+        allow_unverified_db: v4. Before the database is opened, the configured
+            parts database and its provider are checked WITHOUT opening it. An
+            Access database (.mdb/.accdb) without a 64-bit Microsoft Access
+            Database Engine (ACE OLEDB 12.0/16.0) is always refused
+            (errorType PARTS_DB_UNAVAILABLE) - EPLAN would show a modal dialog
+            and block. If the check cannot decide (PARTS_DB_UNVERIFIED), True
+            tries anyway.
 
     Returns:
         dict with success status
     """
+    blocked = _parts_db_guard(allow_unverified_db)
+    if blocked:
+        return blocked
+
     part_number_cs = cs_escape(part_number)
     property_name_cs = cs_escape(_resolve_prop_name(property_name))
     property_value_cs = cs_escape(property_value)
@@ -796,16 +888,29 @@ public class PartsUpdate_{uuid.uuid4().hex[:6]}
     return _execute_script(script)
 
 
-def parts_db_list_product_groups() -> dict:
+def parts_db_list_product_groups(allow_unverified_db: bool = False) -> dict:
     """
     List all product groups and subgroups in the parts database.
 
     The enums are resolved by reflection (v3) - no `using
     Eplan.EplApi.MasterData`, which does not compile on EPLAN 2.9.
 
+    Args:
+        allow_unverified_db: v4. Before the database is opened, the configured
+            parts database and its provider are checked WITHOUT opening it. An
+            Access database (.mdb/.accdb) without a 64-bit Microsoft Access
+            Database Engine (ACE OLEDB 12.0/16.0) is always refused
+            (errorType PARTS_DB_UNAVAILABLE) - EPLAN would show a modal dialog
+            and block. If the check cannot decide (PARTS_DB_UNVERIFIED), True
+            tries anyway.
+
     Returns:
         dict with product groups
     """
+    blocked = _parts_db_guard(allow_unverified_db)
+    if blocked:
+        return blocked
+
     from . import parts_db_reflect
     return _execute_script(parts_db_reflect.product_groups_script())
 

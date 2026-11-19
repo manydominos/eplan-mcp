@@ -14,8 +14,14 @@ scripted.py (same names, parameters and result shape) so _execute_script is
 the one in scripted - which is also what the offline tests stub.
 
 parts_db_create / parts_db_update are unchanged (v3 scope: reads only).
+
+v4: preflight_script / classify_parts_db / guard_response - every parts_db_*
+tool first checks, without opening it, that EPLAN can open the configured
+parts database (no modal dialog on 2.9 64-bit without 64-bit Office/ACE).
 """
 
+import os
+import re
 import uuid
 
 from ._base import cs_escape
@@ -371,3 +377,315 @@ def product_groups_script():
         }
 '''
     return _wrap("PartsGroups", body)
+
+
+# =============================================================================
+# v4: preflight - which parts database, can EPLAN open it? (never opens it)
+# =============================================================================
+# inbox 2026-10-28_eplan_parts_db_blokira_streznik.md: on EPLAN 2.9 64-bit
+# without 64-bit Office, OpenDatabase() shows the MODAL "...ESS_part001.mdb
+# database cannot be opened. Microsoft Office 64 bits is required for a 64-bit
+# version of the EPLAN Platform." and the script (and the MCP server) waited
+# for a click. This script reads only:
+#   - HEServices.PartsService.PartsDatabase (string; "the complete filename of
+#     the current parts database or the connection string if an SQL
+#     connection is selected" - eplan.help API 2.9), path variables resolved
+#     with Base.PathMap.SubstitutePath, both by reflection;
+#   - the OLE DB providers Microsoft.ACE.OLEDB.12.0 / 16.0 in the registry view
+#     of the EPLAN process (64-bit view for 64-bit EPLAN): ProgID -> CLSID ->
+#     InprocServer32 -> the DLL must exist. A ProgID alone is not enough: the
+#     ProgID key is shared by both registry views, the CLSID is not, so a
+#     32-bit ACE would otherwise look available.
+# MDPartsManagement / MasterData is not touched.
+
+_PREFLIGHT = r'''using System;
+using System.IO;
+using System.Text;
+using System.Reflection;
+using System.Collections;
+using System.Collections.Generic;
+using Microsoft.Win32;
+using Eplan.EplApi.Scripting;
+
+public class PartsPreflight_CLSID
+{
+    static string Flatten(Exception ex)
+    {
+        StringBuilder sb = new StringBuilder();
+        Exception e = ex;
+        int depth = 0;
+        while (e != null && depth < 6)
+        {
+            if (sb.Length > 0) sb.Append(" <- ");
+            sb.Append(e.GetType().Name);
+            sb.Append(": ");
+            sb.Append(e.Message);
+            e = e.InnerException;
+            depth++;
+        }
+        return sb.ToString();
+    }
+
+    static Type FindLoadedType(string fullName, string[] loadNames)
+    {
+        foreach (Assembly a in AppDomain.CurrentDomain.GetAssemblies())
+        {
+            try { Type t = a.GetType(fullName); if (t != null) return t; } catch { }
+        }
+        foreach (string n in loadNames)
+        {
+            try
+            {
+                Assembly a = Assembly.Load(n);
+                if (a == null) continue;
+                Type t = a.GetType(fullName);
+                if (t != null) return t;
+            }
+            catch { }
+        }
+        return null;
+    }
+
+    static Dictionary<string, object> Provider(RegistryKey root, string progId)
+    {
+        Dictionary<string, object> d = new Dictionary<string, object>();
+        d["progId"] = progId;
+        d["available"] = false;
+        try
+        {
+            string clsid = null;
+            using (RegistryKey k = root.OpenSubKey(progId + "\\CLSID"))
+            {
+                if (k != null) clsid = k.GetValue("") as string;
+            }
+            d["registered"] = clsid != null;
+            if (clsid == null) return d;
+            d["clsid"] = clsid;
+            string dll = null;
+            using (RegistryKey s = root.OpenSubKey("CLSID\\" + clsid + "\\InprocServer32"))
+            {
+                if (s != null) dll = s.GetValue("") as string;
+            }
+            d["inprocServer"] = dll == null ? "" : dll;
+            if (dll == null) return d;
+            bool exists = false;
+            try { exists = File.Exists(Environment.ExpandEnvironmentVariables(dll)); } catch { }
+            d["dllExists"] = exists;
+            d["available"] = exists;
+        }
+        catch (Exception ex) { d["error"] = Flatten(ex); }
+        return d;
+    }
+
+    [Start]
+    public void Run()
+    {
+        var results = new Dictionary<string, object>();
+        results["is64BitProcess"] = Environment.Is64BitProcess;
+        string db = null;
+        try
+        {
+            Type ps = FindLoadedType("Eplan.EplApi.HEServices.PartsService",
+                new string[] { "Eplan.EplApi.HEServicesu", "Eplan.EplApi.HEServicesNetu" });
+            if (ps == null) throw new Exception("type Eplan.EplApi.HEServices.PartsService not found");
+            object o = Activator.CreateInstance(ps);
+            try
+            {
+                PropertyInfo pi = ps.GetProperty("PartsDatabase", BindingFlags.Public | BindingFlags.Instance,
+                    null, typeof(string), Type.EmptyTypes, null);
+                if (pi == null) throw new Exception("PartsService has no string property PartsDatabase");
+                db = pi.GetValue(o, null) as string;
+            }
+            finally
+            {
+                IDisposable disp = o as IDisposable;
+                if (disp != null) { try { disp.Dispose(); } catch { } }
+            }
+            results["database"] = db == null ? "" : db;
+        }
+        catch (Exception ex) { results["databaseError"] = Flatten(ex); }
+
+        string resolved = db;
+        if (db != null && db.IndexOf("$(") >= 0)
+        {
+            try
+            {
+                Type pm = FindLoadedType("Eplan.EplApi.Base.PathMap",
+                    new string[] { "Eplan.EplApi.Baseu", "Eplan.EplApi.BaseNetu" });
+                MethodInfo sub = pm == null ? null : pm.GetMethod("SubstitutePath",
+                    BindingFlags.Public | BindingFlags.Static, null, new Type[] { typeof(string) }, null);
+                if (sub == null) results["pathMapError"] = "PathMap.SubstitutePath(string) not found";
+                else
+                {
+                    resolved = sub.Invoke(null, new object[] { db }) as string;
+                    results["databaseResolved"] = resolved == null ? "" : resolved;
+                }
+            }
+            catch (Exception ex) { results["pathMapError"] = Flatten(ex); }
+        }
+        if (!string.IsNullOrEmpty(resolved) && resolved.IndexOf('=') < 0)
+        {
+            try { results["databaseFileExists"] = File.Exists(resolved.Trim().Trim('"')); } catch { }
+        }
+
+        List<object> providers = new List<object>();
+        try
+        {
+            RegistryKey root = RegistryKey.OpenBaseKey(RegistryHive.ClassesRoot,
+                Environment.Is64BitProcess ? RegistryView.Registry64 : RegistryView.Registry32);
+            try
+            {
+                providers.Add(Provider(root, "Microsoft.ACE.OLEDB.12.0"));
+                providers.Add(Provider(root, "Microsoft.ACE.OLEDB.16.0"));
+            }
+            finally { root.Close(); }
+        }
+        catch (Exception ex) { results["registryError"] = Flatten(ex); }
+        results["aceProviders"] = providers;
+        results["success"] = true;
+
+        string json = Newtonsoft.Json.JsonConvert.SerializeObject(results);
+        File.WriteAllText(@"{{RESULT_PATH}}", json);
+    }
+}
+'''
+
+
+def preflight_script():
+    """C# that reports the configured parts database and the ACE providers."""
+    return _PREFLIGHT.replace("PartsPreflight_CLSID", "PartsPreflight_" + uuid.uuid4().hex[:6])
+
+
+_ACCESS_EXT = (".mdb", ".accdb")
+_SQL_HINT = re.compile(
+    r"(?i)(?:^|;)\s*(data source|server|initial catalog|database|provider|"
+    r"user id|integrated security|trusted_connection)\s*=")
+
+_HINT_ACCESS = (
+    "On the EPLAN machine install 64-bit Microsoft Office or the 64-bit "
+    "'Microsoft Access Database Engine' (ACE OLEDB), or point EPLAN to an SQL "
+    "parts database (Options > Settings > User > Management > Parts management). "
+    "Until then the parts_db_* tools refuse instead of opening the database.")
+
+
+def classify_parts_db(raw):
+    """
+    Verdict from the preflight envelope (_execute_script's return value).
+
+    {"verdict": "ok" | "unavailable" | "unknown" | "not_connected",
+     "kind": "access" | "sql" | "eplan" | None, "database", "reason", ...}
+    "unavailable" is definitive (EPLAN would show the modal dialog);
+    "unknown" means the check could not decide.
+    """
+    out = {"verdict": "unknown", "kind": None, "database": None, "reason": None}
+    if not isinstance(raw, dict):
+        out["reason"] = "unexpected preflight result: %r" % (raw,)
+        return out
+    info = raw.get("results") if isinstance(raw.get("results"), dict) else None
+    if info is None:
+        msg = str(raw.get("message") or raw.get("error") or "")
+        if "not connected" in msg.lower():
+            out["verdict"] = "not_connected"
+            out["response"] = raw
+            return out
+        out["reason"] = "the preflight script gave no result: %s" % (raw.get("error") or msg or "?")
+        out["preflight"] = {k: raw[k] for k in ("errorType", "message", "compile_errors") if k in raw}
+        return out
+
+    setting = info.get("database") or ""
+    db = info.get("databaseResolved") or setting
+    out["database"] = db or None
+    if setting and setting != db:
+        out["databaseSetting"] = setting
+    out["is64BitProcess"] = info.get("is64BitProcess")
+    providers = [p for p in (info.get("aceProviders") or []) if isinstance(p, dict)]
+    out["aceProviders"] = providers
+    for key in ("databaseError", "pathMapError", "registryError"):
+        if info.get(key):
+            out[key] = info[key]
+
+    if not db:
+        out["reason"] = "EPLAN did not report the parts database (%s)." % (
+            info.get("databaseError") or "empty setting")
+        return out
+
+    path = db.strip().strip('"')
+    ext = os.path.splitext(path)[1].lower()
+    if ext in _ACCESS_EXT:
+        out["kind"] = "access"
+        if info.get("databaseFileExists") is False:
+            out["verdict"] = "unavailable"
+            out["reason"] = ("the Access parts database file does not exist: %s - EPLAN "
+                             "would show 'database cannot be opened'." % path)
+            return out
+        if info.get("is64BitProcess") is False:
+            out["reason"] = "32-bit EPLAN process: the 64-bit ACE check does not apply."
+            return out
+        if "registryError" in info:
+            out["reason"] = "the OLE DB provider registry could not be read: %s" % info["registryError"]
+            return out
+        available = [p.get("progId") for p in providers if p.get("available")]
+        if available:
+            out["verdict"] = "ok"
+            out["reason"] = "64-bit provider registered for EPLAN: %s" % ", ".join(available)
+        else:
+            out["verdict"] = "unavailable"
+            out["reason"] = (
+                "Access parts database, but no 64-bit Microsoft Access Database Engine "
+                "(Microsoft.ACE.OLEDB.12.0 / 16.0) is registered for the EPLAN process. "
+                "Opening it makes EPLAN show the MODAL message 'Microsoft Office 64 bits "
+                "is required for a 64-bit version of the EPLAN Platform' and block until "
+                "someone clicks OK.")
+        return out
+    if _SQL_HINT.search(path):
+        out["kind"] = "sql"
+        out["verdict"] = "ok"
+        out["reason"] = "SQL Server parts database (no Access provider needed)."
+        return out
+    if ext == ".alk":
+        out["kind"] = "eplan"
+        if info.get("databaseFileExists") is False:
+            out["verdict"] = "unavailable"
+            out["reason"] = "the parts database file does not exist: %s" % path
+        else:
+            out["verdict"] = "ok"
+            out["reason"] = "EPLAN parts database (.alk)."
+        return out
+    out["reason"] = "unrecognised parts database type: %s" % path
+    return out
+
+
+def guard_response(verdict, allow_unverified_db=False):
+    """None = open the database; else the refusal (nothing was opened)."""
+    v = verdict.get("verdict")
+    if v == "ok":
+        return None
+    if v == "not_connected":
+        return verdict.get("response") or {"success": False, "message": "Not connected"}
+    if v == "unknown" and allow_unverified_db:
+        return None
+    details = {k: verdict[k] for k in ("database", "databaseSetting", "kind", "is64BitProcess",
+                                       "aceProviders", "databaseError", "pathMapError",
+                                       "registryError", "preflight") if verdict.get(k) is not None}
+    if v == "unavailable":
+        return dict({
+            "success": False,
+            "errorType": "PARTS_DB_UNAVAILABLE",
+            "error": "Parts database NOT opened (it would block EPLAN with a modal "
+                     "dialog): " + (verdict.get("reason") or ""),
+            "partsDatabase": verdict.get("database"),
+            "reason": verdict.get("reason"),
+            "hint": _HINT_ACCESS if verdict.get("kind") == "access" else
+                    "Fix the parts database setting in EPLAN, then call again.",
+        }, **{"preflight": details})
+    return dict({
+        "success": False,
+        "errorType": "PARTS_DB_UNVERIFIED",
+        "error": "Parts database NOT opened: it could not be verified that EPLAN can "
+                 "open it without a modal dialog - " + (verdict.get("reason") or ""),
+        "partsDatabase": verdict.get("database"),
+        "reason": verdict.get("reason"),
+        "hint": "Call again with allow_unverified_db=true to try anyway. If EPLAN then "
+                "shows a dialog, the call ends with EPLAN_CALL_TIMEOUT and the user has "
+                "to click it in EPLAN.",
+    }, **{"preflight": details})
