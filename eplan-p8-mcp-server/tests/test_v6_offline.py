@@ -298,7 +298,7 @@ def test_remove_page_verbose_and_single_unchanged(capture):
     out = S.live_remove_placement("P", remove_page=True, verbose=True)
     assert out["page_before"] == PAGE_BEFORE
     capture["result"] = {"success": True, "results": {"success": True, "page_after": {"placements": []}}}
-    out = S.live_remove_placement("P", handle="h")
+    out = S.live_remove_placement("P", handle="h", verbose=True)  # v7: compact unless verbose
     assert "page_after" in out and "pageBefore" not in out
 
 

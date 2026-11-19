@@ -13,6 +13,8 @@ Six primitives, in the order a caller uses them:
     live_connect_pins       a connection line between two devices' pins
     live_read_page          the canonical page state
     live_remove_placement   undo one placement, or the whole page
+    live_remove_placements  v7: remove many placements in one call (list of
+                            handles, a rectangle, or one macro / device)
 
 DESIGN RULES, each of which exists because its absence produced a real failure
 during development:
@@ -105,6 +107,7 @@ __all__ = [
     "live_connect_pins",
     "live_read_page",
     "live_remove_placement",
+    "live_remove_placements",
     "live_verify_page",
     "live_set_device_tag",
     "live_read_connections",
@@ -465,6 +468,179 @@ _HELPERS_SCHEMATIC = r'''
         if (dt == sel) return true;
         if (sel.IndexOf('=') < 0 && sel.IndexOf('+') < 0)
             return string.Equals(ShortTag(dt), ShortTag(sel), StringComparison.OrdinalIgnoreCase);
+        return false;
+    }
+
+    // ---- v7: removing many placements (live_remove_placements) ---------------
+    // Bounding box as {minX, minY, maxX, maxY}; a placement without
+    // GetBoundingBox falls back to its Location (a point). null = no geometry.
+    static double[] BBoxOf(object pl)
+    {
+        double[] b = null;
+        MethodInfo bbox = MethodByShape(pl.GetType(), "GetBoundingBox", new string[] { }, false);
+        if (bbox != null)
+        {
+            try
+            {
+                object bb = bbox.Invoke(pl, null);
+                if (bb is IEnumerable)
+                    foreach (object p in (IEnumerable)bb)
+                        if (p != null) b = BBoxAdd(b, p);
+            }
+            catch { b = null; }
+        }
+        if (b == null)
+        {
+            object loc = TryRead(pl, "Location", null);
+            if (loc != null) { try { b = BBoxAdd(null, loc); } catch { b = null; } }
+        }
+        return b;
+    }
+
+    static double[] BBoxAdd(double[] b, object pt)
+    {
+        Dictionary<string, object> d = PtDict(pt);
+        double x = Convert.ToDouble(d["x"]), y = Convert.ToDouble(d["y"]);
+        if (b == null)
+        {
+            // (not an array initializer: test_routed_offline counts those in every schematic script)
+            b = new double[4];
+            b[0] = x; b[1] = y; b[2] = x; b[3] = y;
+            return b;
+        }
+        if (x < b[0]) b[0] = x;
+        if (y < b[1]) b[1] = y;
+        if (x > b[2]) b[2] = x;
+        if (y > b[3]) b[3] = y;
+        return b;
+    }
+
+    // inner fully inside outer (tolerance tol, mm).
+    static bool BoxInside(double[] inner, double[] outer, double tol)
+    {
+        if (inner == null || outer == null) return false;
+        return inner[0] >= outer[0] - tol && inner[1] >= outer[1] - tol &&
+               inner[2] <= outer[2] + tol && inner[3] <= outer[3] + tol;
+    }
+
+    static bool PointInside(object pl, double[] outer, double tol)
+    {
+        object loc = TryRead(pl, "Location", null);
+        if (loc == null) return false;
+        Dictionary<string, object> d = PtDict(loc);
+        double x = Convert.ToDouble(d["x"]), y = Convert.ToDouble(d["y"]);
+        return x >= outer[0] - tol && y >= outer[1] - tol && x <= outer[2] + tol && y <= outer[3] + tol;
+    }
+
+    static bool IsGraphicPl(object o)
+    {
+        Type t = o.GetType();
+        string ns = t.Namespace == null ? "" : t.Namespace;
+        if (ns.EndsWith(".Graphics")) return true;
+        switch (t.Name)
+        {
+            case "Line": case "Arc": case "Circle": case "Polyline": case "PolyLine":
+            case "Rectangle": case "Ellipse": case "Hatch": case "Image": case "Text":
+                return true;
+        }
+        return false;
+    }
+
+    // PLC box, black box, ... - a placement that encloses other functions.
+    static bool IsBoxPl(object o)
+    {
+        if (o == null || IsGraphicPl(o) || IsGroupPl(o)) return false;
+        string t = o.GetType().Name;
+        return t == "PLC" || t.EndsWith("Box");
+    }
+
+    static bool IsGroupPl(object o)
+    {
+        Type t = o == null ? null : o.GetType();
+        while (t != null)
+        {
+            if (t.Name == "Group") return true;
+            t = t.BaseType;
+        }
+        return false;
+    }
+
+    static bool TypeIn(object o, string[] types)
+    {
+        if (types == null || types.Length == 0) return true;
+        string tn = o.GetType().Name;
+        foreach (string w in types)
+            if (string.Equals(tn, w, StringComparison.OrdinalIgnoreCase)) return true;
+        return false;
+    }
+
+    // Placement.Group (API 2.9: the group the placement belongs to, or null),
+    // walked up to the outermost group.
+    static object TopGroup(object pl)
+    {
+        object g = TryRead(pl, "Group", null);
+        int guard = 0;
+        while (g != null && guard++ < 20)
+        {
+            object up = TryRead(g, "Group", null);
+            if (up == null) break;
+            g = up;
+        }
+        return g;
+    }
+
+    // Group.SubPlacements (API 2.9), recursively; nested groups included.
+    static void GroupMembers(object grp, List<object> into, int depth)
+    {
+        if (grp == null || depth > 20) return;
+        object subs = TryRead(grp, "SubPlacements", null);
+        if (!(subs is IEnumerable)) return;
+        foreach (object m in (IEnumerable)subs)
+        {
+            if (m == null) continue;
+            into.Add(m);
+            if (IsGroupPl(m)) GroupMembers(m, into, depth + 1);
+        }
+    }
+
+    static bool IsValidObj(object o)
+    {
+        object v = TryRead(o, "IsValid", null);
+        if (v == null) return true;
+        try { return Convert.ToBoolean(v); } catch { return true; }
+    }
+
+    static void AddPick(Dictionary<string, object> objs, Dictionary<string, string> why,
+                        List<string> order, object pl, string reason)
+    {
+        if (pl == null) return;
+        string h = Handle(pl);
+        if (h == null) return;
+        if (objs.ContainsKey(h)) return;
+        objs[h] = pl;
+        why[h] = reason;
+        order.Add(h);
+    }
+
+    static Dictionary<string, object> PickRecord(object pl, string h, string reason, bool full)
+    {
+        Dictionary<string, object> d = full ? DumpPlacement(pl, false) : new Dictionary<string, object>();
+        d["handle"] = h;
+        d["clrType"] = pl.GetType().Name;
+        if (!full)
+        {
+            string n = SafeText(TryRead(pl, "Name", null));
+            if (n != null && n.Length > 0) d["name"] = n;
+        }
+        d["reason"] = reason;
+        return d;
+    }
+
+    static bool TagHit(string name, string[] tags)
+    {
+        if (name == null || name.Length == 0 || tags == null) return false;
+        foreach (string t in tags)
+            if (t != null && t.Length > 0 && NameMatches(name, t)) return true;
         return false;
     }
 '''
@@ -1647,9 +1823,13 @@ def live_remove_placement(page: str, handle: str = None,
                           expect_type: str = None, remove_page: bool = False,
                           allow_real_project: bool = False,
                           timeout_seconds: float = 90.0,
-                          verbose: bool = False) -> dict:
+                          verbose: bool = False,
+                          save_page_files: bool = False) -> dict:
     """
     Remove one placement, or a whole page. WRITES - scratch-only by default.
+
+    v7: to remove MANY placements (a whole macro, a rectangle, a list of
+    handles) in one call use live_remove_placements - not this tool in a loop.
 
     This is the undo for the writers above: each of them returns an "undo" dict
     naming this tool and the handle to pass. Reversibility is what makes the
@@ -1671,16 +1851,22 @@ def live_remove_placement(page: str, handle: str = None,
             handle to be omitted, so it cannot happen by accident.
         allow_real_project: Must be True to write outside the scratch root.
         timeout_seconds: Default 90s.
-        verbose: v6, remove_page only. False (default): "page_before" is
-            written to a JSON file on the EPLAN machine ("pageBeforeFile") and
-            the answer carries "pageBefore": {"placementCount", "countsByType",
-            "functionNames", ...}; True returns "page_before" in full (~60 kB
-            for one macro page).
+        verbose: v6 remove_page, v7 also one placement. False (default):
+            remove_page writes "page_before" to a JSON file on the EPLAN
+            machine ("pageBeforeFile") and answers "pageBefore":
+            {"placementCount", "countsByType", "functionNames", ...}; one
+            placement answers "removed" {clrType, handle, name, location} and
+            "pageAfter" {"placementCount", "countsByType"} (~0.5 kB instead of
+            the full page_after, ~25 kB for a macro page). True: "page_before"
+            / "page_after" and "removed" in full, as in v6.
+        save_page_files: v7, one placement only. True writes the full
+            page_after to a JSON file on the EPLAN machine ("pageAfterFile").
 
     Returns:
-        {"success", "page", "removed", "removedType", "page_after"} - or, for
-        remove_page, {"pageRemoved": true, "pageBefore", "pageBeforeFile"}
-        ("page_before" with verbose=True) as the record of what was destroyed.
+        {"success", "page", "removed", "removedType", "pageAfter"}
+        ("page_after" with verbose=True) - or, for remove_page,
+        {"pageRemoved": true, "pageBefore", "pageBeforeFile"} ("page_before"
+        with verbose=True) as the record of what was destroyed.
     """
     try:
         page_cs = cs_escape(cs_text(page, "page"))
@@ -1736,6 +1922,644 @@ def live_remove_placement(page: str, handle: str = None,
     ))
     if remove_page and not verbose and out.get("success"):
         out = _page_before_summary(out)
+    if not remove_page and out.get("success"):
+        out = _single_remove_compact(out, verbose, save_page_files)
+    return out
+
+
+def _page_file(kind, page_dict, page_name):
+    """v7: write a page read (page_before / page_after / removed list) to a JSON file on this machine."""
+    from .scripted import _WORK_ROOT
+    folder = os.path.join(_WORK_ROOT, kind)
+    os.makedirs(folder, exist_ok=True)
+    base = re.sub(r"[^A-Za-z0-9._-]+", "_", str(page_name or "page")).strip("_") or "page"
+    path = os.path.join(folder, "%s_%s_%s.json" % (base, time.strftime("%Y%m%d_%H%M%S"), uuid.uuid4().hex[:4]))
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(page_dict, f, ensure_ascii=False, indent=1)
+    return path
+
+
+def _counts_by_type(page_dict):
+    counts = {}
+    for pl in (page_dict or {}).get("placements") or []:
+        t = pl.get("clrType") or "?"
+        counts[t] = counts.get(t, 0) + 1
+    return counts
+
+
+def _single_remove_compact(out, verbose, save_page_files):
+    """v7 (inbox 2026-10-30_eplan_remove_placement_brez_kompaktnega_izhoda...): one placement, compact answer."""
+    pa = out.get("page_after")
+    if save_page_files and isinstance(pa, dict):
+        try:
+            out["pageAfterFile"] = _page_file("page_after", pa, out.get("page"))
+        except (OSError, TypeError, ValueError) as exc:
+            out["pageAfterFileError"] = str(exc)
+    if verbose:
+        return out
+    out.pop("page_after", None)
+    if isinstance(pa, dict):
+        out["pageAfter"] = {"placementCount": pa.get("placementCount"), "returned": pa.get("returned"),
+                            "truncated": pa.get("truncated"), "countsByType": _counts_by_type(pa)}
+    rm = out.get("removed")
+    if isinstance(rm, dict):
+        out["removed"] = {k: rm[k] for k in ("clrType", "handle", "name", "location") if k in rm}
+    return out
+
+
+def _cs_str_array(values, what):
+    if not values:
+        return "new string[0]"
+    return "new string[] { %s }" % ", ".join('"%s"' % cs_escape(cs_text(v, what)) for v in values)
+
+
+def _str_list(value, what, maximum=2000):
+    """None / "a" / ["a", "b"] -> list of non-empty unique strings (order kept)."""
+    if value is None:
+        return []
+    if isinstance(value, str):
+        value = [value]
+    if not isinstance(value, (list, tuple)):
+        raise SchematicValueError("%s must be a list of strings, got %s." % (what, type(value).__name__))
+    out = []
+    for v in value:
+        if not isinstance(v, str) or not v.strip():
+            raise SchematicValueError("%s entries must be non-empty strings, got %r." % (what, v))
+        v = v.strip()
+        if v not in out:
+            out.append(v)
+    if len(out) > maximum:
+        raise SchematicValueError("%s: at most %d entries, got %d." % (what, maximum, len(out)))
+    return out
+
+
+_REMOVE_MANY_BODY = '''
+            object page = FindPage(project, PAGENAME);
+            results["page"] = PropText(page, "Name");
+            string v7mode = V7MODE;
+            string[] v7handles = V7HANDLES;
+            string[] v7exTags = V7EXTAGS;
+            string[] v7exHandles = V7EXHANDLES;
+            string[] v7types = V7TYPES;
+            double[] v7rect = new double[] { V7RX1, V7RY1, V7RX2, V7RY2 };
+            string v7macro = V7MACRO;
+            bool v7dry = V7DRY;
+            bool v7full = V7FULL;
+            int v7max = V7MAX;
+            double tol = 0.01;
+
+            // Every placement of the page, by handle (stable within one session).
+            List<object> all = new List<object>();
+            Dictionary<string, object> byHandle = new Dictionary<string, object>();
+            foreach (object pl in PagePlacements(page))
+            {
+                if (pl == null) continue;
+                all.Add(pl);
+                string h0 = Handle(pl);
+                if (h0 != null && !byHandle.ContainsKey(h0)) byHandle[h0] = pl;
+            }
+            results["placementCountBefore"] = all.Count;
+            if (V7SAVEPAGE && !v7dry) results["page_before"] = ReadPage(page, 5000, false, null);
+
+            Dictionary<string, object> pick = new Dictionary<string, object>();
+            Dictionary<string, string> why = new Dictionary<string, string>();
+            List<string> order = new List<string>();
+            List<string> warnings = new List<string>();
+            string refused = null;
+            string refusedWhy = null;
+
+            if (v7mode == "handles")
+            {
+                List<string> missing = new List<string>();
+                foreach (string h in v7handles)
+                {
+                    object pl;
+                    if (byHandle.TryGetValue(h, out pl)) AddPick(pick, why, order, pl, "handle");
+                    else missing.Add(h);
+                }
+                if (missing.Count > 0)
+                    throw new Exception("Nothing removed: " + missing.Count + " handle(s) are not on page '" +
+                        PropText(page, "Name") + "': " + string.Join(", ", missing.ToArray()) +
+                        ". Handles are session-scoped; re-read the page (live_read_page).");
+                if (v7types.Length > 0)
+                    foreach (string h in order)
+                        if (!TypeIn(pick[h], v7types))
+                            throw new Exception("Nothing removed: handle " + h + " is a " + pick[h].GetType().Name +
+                                ", not one of types [" + string.Join(", ", v7types) + "].");
+            }
+            else if (v7mode == "region")
+            {
+                foreach (object pl in all)
+                {
+                    if (!TypeIn(pl, v7types)) continue;
+                    bool hit = V7REGIONMATCH == "location" ? PointInside(pl, v7rect, tol) : BoxInside(BBoxOf(pl), v7rect, tol);
+                    if (hit) AddPick(pick, why, order, pl, "region");
+                }
+            }
+            else
+            {
+                // macro_of: one device / macro instance. Anchor = the functions with
+                // the device tag (box + its connection points), then their group
+                // (Placement.Group, if the macro was inserted grouped), then
+                // everything lying fully inside the box outline.
+                string tag = v7macro;
+                List<object> anchors = new List<object>();
+                if (v7macro.IndexOf('/') >= 0)
+                {
+                    object a;
+                    if (!byHandle.TryGetValue(v7macro, out a))
+                        throw new Exception("Nothing removed: no placement with handle '" + v7macro + "' on page '" +
+                            PropText(page, "Name") + "'. Re-read the page.");
+                    anchors.Add(a);
+                    tag = DtPart(SafeText(TryRead(a, "Name", null)));
+                }
+                if (tag != null && tag.Trim().Length > 0)
+                    foreach (object pl in all)
+                        if (IsFunctionType(pl) && TagHit(SafeText(TryRead(pl, "Name", null)), new string[] { tag }) && !anchors.Contains(pl))
+                            anchors.Add(pl);
+                if (anchors.Count == 0)
+                {
+                    List<string> names = new List<string>();
+                    foreach (object pl in all)
+                    {
+                        if (!IsFunctionType(pl)) continue;
+                        string n = DtPart(SafeText(TryRead(pl, "Name", null)));
+                        if (n.Length > 0 && !names.Contains(n) && names.Count < 40) names.Add(n);
+                    }
+                    throw new Exception("Nothing removed: no function with device tag '" + v7macro + "' on page '" +
+                        PropText(page, "Name") + "'. Device tags on the page: " + string.Join(" | ", names.ToArray()));
+                }
+                results["macroTag"] = tag;
+                foreach (object a in anchors) AddPick(pick, why, order, a, "device");
+                if (V7INCBOX)
+                {
+                    List<object> boxes = new List<object>();
+                    foreach (object a in anchors) if (IsBoxPl(a)) boxes.Add(a);
+                    List<object> outline = new List<object>();
+                    foreach (object b in boxes)
+                    {
+                        double[] bb = BBoxOf(b);
+                        if (bb == null) continue;
+                        Dictionary<string, object> o = new Dictionary<string, object>();
+                        o["handle"] = Handle(b);
+                        o["min"] = new double[] { bb[0], bb[1] };
+                        o["max"] = new double[] { bb[2], bb[3] };
+                        outline.Add(o);
+                        foreach (object pl in all) if (BoxInside(BBoxOf(pl), bb, tol)) AddPick(pick, why, order, pl, "insideBox");
+                    }
+                    results["boxOutline"] = outline;
+                    if (boxes.Count == 0) warnings.Add("No box (PLC / *Box) among the functions of '" + tag +
+                        "' - only the functions" + (V7INCGROUP ? " and their group" : "") + " are selected; graphics and texts " +
+                        "of the macro are not. Add them with a region call.");
+                }
+                if (V7INCGROUP)
+                {
+                    // the group(s) of everything selected so far (box, its points, graphics inside it)
+                    foreach (string h in new List<string>(order))
+                    {
+                        object g = IsGroupPl(pick[h]) ? pick[h] : TopGroup(pick[h]);
+                        if (g == null) continue;
+                        AddPick(pick, why, order, g, "group");
+                        List<object> mem = new List<object>();
+                        GroupMembers(g, mem, 0);
+                        foreach (object m in mem) AddPick(pick, why, order, m, "group");
+                    }
+                }
+                if (v7types.Length > 0)
+                {
+                    List<string> keep = new List<string>();
+                    foreach (string h in order) if (TypeIn(pick[h], v7types)) keep.Add(h); else { pick.Remove(h); why.Remove(h); }
+                    order = keep;
+                }
+            }
+
+            // ---- exclusions: handles and device tags that must stay ----------
+            Dictionary<string, object> ex = new Dictionary<string, object>();
+            Dictionary<string, string> exWhy = new Dictionary<string, string>();
+            List<string> exOrder = new List<string>();
+            List<string> exHandlesMissing = new List<string>();
+            foreach (string h in v7exHandles)
+            {
+                object pl;
+                if (byHandle.TryGetValue(h, out pl)) AddPick(ex, exWhy, exOrder, pl, "excludeHandle");
+                else exHandlesMissing.Add(h);
+            }
+            List<string> exFunctions = new List<string>();
+            List<string> exTagsFound = new List<string>();
+            foreach (object pl in all)
+            {
+                if (!IsFunctionType(pl)) continue;
+                string n = SafeText(TryRead(pl, "Name", null));
+                if (!TagHit(n, v7exTags)) continue;
+                AddPick(ex, exWhy, exOrder, pl, "excludeTag");
+                if (!exFunctions.Contains(n)) exFunctions.Add(n);
+                foreach (string t in v7exTags) if (NameMatches(n, t) && !exTagsFound.Contains(t)) exTagsFound.Add(t);
+            }
+            List<string> exTagsMissing = new List<string>();
+            foreach (string t in v7exTags) if (!exTagsFound.Contains(t)) exTagsMissing.Add(t);
+            if (V7EXEXPAND)
+            {
+                List<object> seeds = new List<object>();
+                foreach (string h in exOrder) seeds.Add(ex[h]);
+                foreach (object s in seeds)
+                {
+                    object g = TopGroup(s);
+                    if (g != null)
+                    {
+                        AddPick(ex, exWhy, exOrder, g, "excludeGroup");
+                        List<object> mem = new List<object>();
+                        GroupMembers(g, mem, 0);
+                        foreach (object m in mem) AddPick(ex, exWhy, exOrder, m, "excludeGroup");
+                    }
+                    if (IsBoxPl(s))
+                    {
+                        double[] bb = BBoxOf(s);
+                        if (bb != null) foreach (object pl in all) if (BoxInside(BBoxOf(pl), bb, tol)) AddPick(ex, exWhy, exOrder, pl, "insideExcludedBox");
+                    }
+                }
+            }
+            results["excludedFunctions"] = exFunctions;
+            results["excludedCount"] = exOrder.Count;
+            if (exTagsMissing.Count > 0) warnings.Add("exclude_device_tags not found on this page (nothing to protect there): " +
+                string.Join(", ", exTagsMissing.ToArray()));
+            if (exHandlesMissing.Count > 0) warnings.Add("exclude_handles not on this page: " + string.Join(", ", exHandlesMissing.ToArray()));
+
+            List<string> hits = new List<string>();
+            foreach (string h in order) if (ex.ContainsKey(h)) hits.Add(h);
+            if (hits.Count > 0)
+            {
+                if (v7mode == "region")
+                {
+                    List<string> keep = new List<string>();
+                    foreach (string h in order) if (!ex.ContainsKey(h)) keep.Add(h); else { pick.Remove(h); why.Remove(h); }
+                    order = keep;
+                    results["excludedFromSelection"] = hits.Count;
+                }
+                else
+                {
+                    List<string> desc = new List<string>();
+                    foreach (string h in hits)
+                    {
+                        if (desc.Count >= 20) break;
+                        string n = SafeText(TryRead(pick[h], "Name", null));
+                        desc.Add(pick[h].GetType().Name + " " + h + (n == null || n.Length == 0 ? "" : " '" + n + "'") + " (" + exWhy[h] + ")");
+                    }
+                    refused = "EXCLUDED_HIT";
+                    refusedWhy = hits.Count + " selected placement(s) belong to an excluded device / handle - nothing removed: " +
+                        string.Join("; ", desc.ToArray());
+                }
+            }
+
+            // ---- a group object goes only with ALL its members ----------------
+            List<string> groupsKept = new List<string>();
+            List<Dictionary<string, object>> groupInfo = new List<Dictionary<string, object>>();
+            Dictionary<string, bool> seenGroups = new Dictionary<string, bool>();
+            foreach (string h in new List<string>(order))
+            {
+                object g = IsGroupPl(pick[h]) ? pick[h] : TopGroup(pick[h]);
+                if (g == null) continue;
+                string gh = Handle(g);
+                if (gh == null || seenGroups.ContainsKey(gh)) continue;
+                seenGroups[gh] = true;
+                List<object> mem = new List<object>();
+                GroupMembers(g, mem, 0);
+                int selN = 0;
+                foreach (object m in mem) { string mh = Handle(m); if (mh != null && pick.ContainsKey(mh)) selN++; }
+                Dictionary<string, object> gi = new Dictionary<string, object>();
+                gi["handle"] = gh;
+                gi["members"] = mem.Count;
+                gi["selectedMembers"] = selN;
+                groupInfo.Add(gi);
+                if (pick.ContainsKey(gh) && selN < mem.Count)
+                {
+                    pick.Remove(gh); why.Remove(gh); order.Remove(gh);
+                    groupsKept.Add(gh);
+                }
+            }
+            results["groups"] = groupInfo;
+            if (groupsKept.Count > 0) results["groupsKept"] = groupsKept;
+
+            if (refused == null && order.Count > v7max)
+            {
+                refused = "TOO_MANY";
+                refusedWhy = order.Count + " placements selected, more than max_items=" + v7max +
+                    " - nothing removed. Narrow the selection or raise max_items.";
+            }
+
+            // ---- record of the selection (before anything is removed) ---------
+            List<object> items = new List<object>();
+            Dictionary<string, int> byType = new Dictionary<string, int>();
+            Dictionary<string, int> byReason = new Dictionary<string, int>();
+            double[] selBox = null;
+            foreach (string h in order)
+            {
+                object pl = pick[h];
+                items.Add(PickRecord(pl, h, why[h], v7full));
+                string tn = pl.GetType().Name;
+                byType[tn] = byType.ContainsKey(tn) ? byType[tn] + 1 : 1;
+                byReason[why[h]] = byReason.ContainsKey(why[h]) ? byReason[why[h]] + 1 : 1;
+                double[] bb = BBoxOf(pl);
+                if (bb != null)
+                {
+                    if (selBox == null) selBox = new double[] { bb[0], bb[1], bb[2], bb[3] };
+                    else { selBox[0] = Math.Min(selBox[0], bb[0]); selBox[1] = Math.Min(selBox[1], bb[1]);
+                           selBox[2] = Math.Max(selBox[2], bb[2]); selBox[3] = Math.Max(selBox[3], bb[3]); }
+                }
+            }
+            results["selectedCount"] = order.Count;
+            results["countsByType"] = byType;
+            results["countsByReason"] = byReason;
+            results["items"] = items;
+            if (selBox != null)
+            {
+                Dictionary<string, object> sb = new Dictionary<string, object>();
+                sb["min"] = new double[] { Math.Round(selBox[0], 4), Math.Round(selBox[1], 4) };
+                sb["max"] = new double[] { Math.Round(selBox[2], 4), Math.Round(selBox[3], 4) };
+                results["selectionBox"] = sb;
+            }
+            if (refused != null) { results["refused"] = refused; results["refusedReason"] = refusedWhy; }
+            if (order.Count == 0) warnings.Add("Nothing selected.");
+            results["warnings"] = warnings;
+
+            if (!v7dry && refused == null && order.Count > 0)
+            {
+                // Leaves first, boxes after them, group objects last.
+                List<string> seq = new List<string>();
+                foreach (string h in order) if (!IsBoxPl(pick[h]) && !IsGroupPl(pick[h])) seq.Add(h);
+                foreach (string h in order) if (IsBoxPl(pick[h])) seq.Add(h);
+                foreach (string h in order) if (IsGroupPl(pick[h])) seq.Add(h);
+                List<string> removedH = new List<string>();
+                List<string> goneBefore = new List<string>();
+                Dictionary<string, int> routes = new Dictionary<string, int>();
+                Dictionary<string, object> touchedGroups = new Dictionary<string, object>();
+                foreach (string h in seq)
+                {
+                    object pl = pick[h];
+                    if (!IsValidObj(pl)) { goneBefore.Add(h); continue; }
+                    object g = IsGroupPl(pl) ? null : TryRead(pl, "Group", null);
+                    string route = "Remove";
+                    try
+                    {
+                        MethodInfo rm = RequireMethod(pl.GetType(), "Remove", new string[] { }, false);
+                        Call(rm, pl, null);
+                    }
+                    catch (Exception ex1)
+                    {
+                        MethodInfo rs = g == null ? null : MethodByShape(g.GetType(), "RemoveSubPlacement", new string[] { "" }, false);
+                        if (rs == null)
+                        {
+                            Dictionary<string, object> fa = new Dictionary<string, object>();
+                            fa["handle"] = h; fa["clrType"] = pl.GetType().Name; fa["error"] = Flatten(ex1);
+                            results["failedAt"] = fa;
+                            break;
+                        }
+                        try { Call(rs, g, new object[] { pl }); route = "Group.RemoveSubPlacement"; }
+                        catch (Exception ex2)
+                        {
+                            Dictionary<string, object> fa = new Dictionary<string, object>();
+                            fa["handle"] = h; fa["clrType"] = pl.GetType().Name;
+                            fa["error"] = Flatten(ex1) + " / Group.RemoveSubPlacement: " + Flatten(ex2);
+                            results["failedAt"] = fa;
+                            break;
+                        }
+                    }
+                    routes[route] = routes.ContainsKey(route) ? routes[route] + 1 : 1;
+                    removedH.Add(h);
+                    if (g != null) { string gh = Handle(g); if (gh != null && !pick.ContainsKey(gh)) touchedGroups[gh] = g; }
+                }
+                // A group emptied by this call is removed too (it would stay as an invisible empty object).
+                List<string> emptyGroups = new List<string>();
+                foreach (KeyValuePair<string, object> kv in touchedGroups)
+                {
+                    if (!IsValidObj(kv.Value)) continue;
+                    List<object> mem = new List<object>();
+                    GroupMembers(kv.Value, mem, 0);
+                    int alive = 0;
+                    foreach (object m in mem) if (IsValidObj(m)) alive++;
+                    if (alive > 0) continue;
+                    try { Call(RequireMethod(kv.Value.GetType(), "Remove", new string[] { }, false), kv.Value, null); emptyGroups.Add(kv.Key); }
+                    catch (Exception exg) { warnings.Add("Empty group " + kv.Key + " not removed: " + Flatten(exg)); }
+                }
+                results["removedCount"] = removedH.Count;
+                results["removedRoutes"] = routes;
+                if (goneBefore.Count > 0) results["goneWithOthers"] = goneBefore;
+                if (emptyGroups.Count > 0) results["emptyGroupsRemoved"] = emptyGroups;
+                results["partial"] = results.ContainsKey("failedAt");
+
+                // ---- read back --------------------------------------------------
+                int after = 0;
+                Dictionary<string, bool> present = new Dictionary<string, bool>();
+                List<string> exNamesAfter = new List<string>();
+                foreach (object pl in PagePlacements(page))
+                {
+                    if (pl == null) continue;
+                    after++;
+                    string h = Handle(pl);
+                    if (h != null) present[h] = true;
+                    if (IsFunctionType(pl))
+                    {
+                        string n = SafeText(TryRead(pl, "Name", null));
+                        if (n != null && exFunctions.Contains(n) && !exNamesAfter.Contains(n)) exNamesAfter.Add(n);
+                    }
+                }
+                List<string> still = new List<string>();
+                foreach (string h in removedH) if (present.ContainsKey(h)) still.Add(h);
+                List<string> exLost = new List<string>();
+                foreach (string n in exFunctions) if (!exNamesAfter.Contains(n)) exLost.Add(n);
+                results["placementCountAfter"] = after;
+                results["stillPresent"] = still;
+                results["excludedStillPresent"] = exNamesAfter.Count;
+                if (exLost.Count > 0) results["excludedLost"] = exLost;
+                if (V7SAVEPAGE) results["page_after"] = ReadPage(page, 5000, false, null);
+            }
+'''
+
+
+def live_remove_placements(page: str, handles: list = None, region: list = None,
+                           macro_of: str = None,
+                           exclude_device_tags: list = None, exclude_handles: list = None,
+                           types: list = None, region_match: str = "inside",
+                           include_group: bool = True, include_box_area: bool = True,
+                           exclude_expand: bool = True, max_items: int = 200,
+                           dry_run: bool = True, allow_real_project: bool = False,
+                           save_page_files: bool = True, verbose: bool = False,
+                           list_limit: int = 60,
+                           timeout_seconds: float = 180.0) -> dict:
+    """
+    v7: remove MANY placements of one page in one call. WRITES (unless
+    dry_run, the default) - scratch-only unless allow_real_project=True
+    (dry_run only reads and needs no allow_real_project).
+
+    Use it to clear an old macro (PLC box + connection points + graphics +
+    texts) instead of live_remove_placement in a loop. Pass EXACTLY ONE
+    selector:
+
+      handles=[...]      these placements (all must be on the page, otherwise
+                         nothing is removed).
+      region=[x1, y1, x2, y2]
+                         every placement lying FULLY inside the rectangle (page
+                         mm; corner order free). region_match="location": the
+                         placement's insertion point inside is enough.
+      macro_of="500S1"   one device / macro instance: every function with that
+                         device tag on the page (box + its connection points;
+                         "500S1", "=AB-C+ET-1-500S1" or the box handle
+                         "218/34/.../0"), + everything lying fully inside the
+                         box outline (include_box_area: graphics, texts, bus
+                         terminal), + the group of all of these
+                         (include_group: EPLAN Placement.Group, if the macro
+                         was inserted grouped).
+                         Texts/graphics OUTSIDE the box are not part of it -
+                         see "boxOutline" and add them with a region call.
+
+    Safety (nothing is removed when a check fails; no rollback is needed):
+      exclude_device_tags=["500K3"] / exclude_handles=[...]: these stay. With
+        exclude_expand (default) also their group and everything inside an
+        excluded box. region: excluded placements are left out of the
+        selection ("excludedFromSelection"). handles / macro_of: a selection
+        that touches an excluded placement is REFUSED as a whole
+        (errorType EXCLUDED_HIT).
+      max_items (default 200): more selected placements -> refused
+        (errorType TOO_MANY).
+      types=["PolyLine", "Text"]: handles - every handle must be one of them;
+        region / macro_of - only these types are selected.
+      A group object is removed only together with ALL its members.
+      dry_run=True (DEFAULT): selects and reports, removes nothing. Look at
+        countsByType / items, then call again with dry_run=False.
+
+    Args:
+        page: Page name, e.g. "=AB-C+ET-1/900".
+        handles / region / macro_of: the selector (exactly one).
+        exclude_device_tags, exclude_handles, exclude_expand: see above.
+        types: optional CLR type names (see above).
+        region_match: "inside" (default, bounding box fully inside) or
+            "location" (insertion point inside).
+        include_group, include_box_area: macro_of parts (default True).
+        max_items: 1..5000, default 200.
+        dry_run: default True.
+        allow_real_project: must be True to write outside the scratch root.
+        save_page_files: default True (not in dry_run): full page_before,
+            page_after and the full list of removed placements go to JSON
+            files on the EPLAN machine ("pageBeforeFile", "pageAfterFile",
+            "itemsFile") - the record of what was destroyed.
+        verbose: True = every item with the full placement record and the
+            whole list in the answer.
+        list_limit: items returned in the answer (default 60; the rest only
+            in itemsFile). 0 = counts only.
+        timeout_seconds: default 180.
+
+    Returns:
+        {"success", "page", "mode", "dryRun", "selectedCount", "countsByType",
+         "countsByReason", "items": [{handle, clrType, name, reason}],
+         "itemsTruncated", "selectionBox", "boxOutline", "groups",
+         "excludedFunctions", "excludedCount", "excludedFromSelection",
+         "warnings", "placementCountBefore",
+         and after a real run: "removedCount", "placementCountAfter",
+         "stillPresent" (must be []), "excludedStillPresent", "excludedLost",
+         "partial", "failedAt", "pageBeforeFile", "pageAfterFile", "itemsFile"}.
+        A refused call: success false, "errorType" EXCLUDED_HIT / TOO_MANY,
+        with the same report. "partial": true means EPLAN refused one removal
+        midway - "removedCount" placements are gone, "failedAt" says which
+        one stopped it (no rollback; restore from the backup if needed).
+    """
+    try:
+        page_cs = cs_escape(cs_text(page, "page"))
+        hl = _str_list(handles, "handles")
+        ext = _str_list(exclude_device_tags, "exclude_device_tags", 200)
+        exh = _str_list(exclude_handles, "exclude_handles")
+        tl = _str_list(types, "types", 50)
+        chosen = [n for n, v in (("handles", hl), ("region", region), ("macro_of", macro_of)) if v]
+        if len(chosen) != 1:
+            raise SchematicValueError(
+                "Pass exactly one selector - handles=[...], region=[x1, y1, x2, y2] or "
+                "macro_of='500S1' (got %s)." % (", ".join(chosen) or "none"))
+        rect = [0.0, 0.0, 0.0, 0.0]
+        if region:
+            if isinstance(region, dict):
+                region = [region.get(k) for k in ("x1", "y1", "x2", "y2")]
+            if not isinstance(region, (list, tuple)) or len(region) != 4:
+                raise SchematicValueError("region must be [x1, y1, x2, y2] (page mm), got %r." % (region,))
+            x1, y1, x2, y2 = (float(cs_double(v, "region")) for v in region)
+            rect = [min(x1, x2), min(y1, y2), max(x1, x2), max(y1, y2)]
+            if rect[2] - rect[0] <= 0 or rect[3] - rect[1] <= 0:
+                raise SchematicValueError("region has no area: %r." % (region,))
+        macro = cs_escape(cs_text(macro_of, "macro_of")) if macro_of else ""
+        if region_match not in ("inside", "location"):
+            raise SchematicValueError("region_match must be 'inside' or 'location', got %r." % (region_match,))
+        mx = cs_int(max_items, "max_items", minimum=1, maximum=5000)
+        ll = cs_int(list_limit, "list_limit", minimum=0, maximum=5000)
+        # dry_run reads only - no scratch guard (as live_set_device_tags)
+        body = ("" if dry_run else _guard_prelude(allow_real_project)) + _fill(
+            _REMOVE_MANY_BODY,
+            PAGENAME='"%s"' % page_cs,
+            V7MODE='"%s"' % ("handles" if hl else "region" if region else "macro"),
+            V7HANDLES=_cs_str_array(hl, "handles"),
+            V7EXTAGS=_cs_str_array(ext, "exclude_device_tags"),
+            V7EXHANDLES=_cs_str_array(exh, "exclude_handles"),
+            V7TYPES=_cs_str_array(tl, "types"),
+            V7RX1=cs_double(rect[0], "region"), V7RY1=cs_double(rect[1], "region"),
+            V7RX2=cs_double(rect[2], "region"), V7RY2=cs_double(rect[3], "region"),
+            V7MACRO='"%s"' % macro,
+            V7DRY=cs_bool(dry_run),
+            V7FULL=cs_bool(verbose),
+            V7MAX=str(mx),
+            V7SAVEPAGE=cs_bool(save_page_files),
+            V7REGIONMATCH='"%s"' % region_match,
+            V7INCGROUP=cs_bool(include_group),
+            V7INCBOX=cs_bool(include_box_area),
+            V7EXEXPAND=cs_bool(exclude_expand),
+        )
+    except (SchematicValueError, TypeError, ValueError) as exc:
+        return _err(exc)
+
+    out = _shape(_execute_script(
+        _script(_cls("RemoveMany"), body, extra_helpers=_HELPERS_SCHEMATIC),
+        timeout=timeout_seconds,
+    ))
+    if not out.get("success"):
+        return out
+    out["mode"] = "handles" if hl else "region" if region else "macro_of"
+    out["dryRun"] = bool(dry_run)
+    items = out.get("items") or []
+    pb, pa = out.pop("page_before", None), out.pop("page_after", None)
+    if save_page_files and not dry_run:
+        for key, data, kind in (("pageBeforeFile", pb, "page_before"), ("pageAfterFile", pa, "page_after"),
+                                ("itemsFile", {"page": out.get("page"), "items": items}, "removed_items")):
+            if data is None:
+                continue
+            try:
+                out[key] = _page_file(kind, data, out.get("page"))
+            except (OSError, TypeError, ValueError) as exc:
+                out[key + "Error"] = str(exc)
+    if not verbose and len(items) > ll:
+        out["items"] = items[:ll]
+        out["itemsTruncated"] = len(items)
+    if not out.get("warnings"):
+        out.pop("warnings", None)
+    if out.get("refused"):
+        out["errorType"] = out.pop("refused")
+        out["error"] = out.pop("refusedReason", "refused")
+        if dry_run:
+            out["wouldRefuse"] = out.pop("errorType")
+            out["wouldRefuseReason"] = out.pop("error")
+        else:
+            out["success"] = False
+            out["removedCount"] = 0
+    elif not dry_run:
+        if out.get("partial"):
+            out["success"] = False
+            out["errorType"] = "PARTIAL"
+            out["error"] = ("EPLAN refused a removal midway: %s placement(s) removed, then stopped at %s. "
+                            "No rollback - restore from the backup if needed."
+                            % (out.get("removedCount"), (out.get("failedAt") or {}).get("handle")))
+        elif out.get("stillPresent"):
+            out["success"] = False
+            out["errorType"] = "NOT_REMOVED"
+            out["error"] = "Placement(s) still on the page after Remove: %s" % out["stillPresent"]
+        elif out.get("excludedLost"):
+            out["success"] = False
+            out["errorType"] = "EXCLUDED_LOST"
+            out["error"] = ("Excluded function(s) no longer on the page after the removal: %s - check the page "
+                            "(EPLAN removed them together with a selected placement)." % out["excludedLost"])
     return out
 
 
