@@ -59,9 +59,12 @@ while not os.path.exists(os.path.join(_MCP_ROOT, "eplan_connection.py")):
         break
     _MCP_ROOT = _parent
 
-# Directory for generated scripts and results (shared, under mcp_server/scripts)
-SCRIPT_DIR = os.path.join(_MCP_ROOT, "scripts", "generated")
-RESULTS_DIR = os.path.join(_MCP_ROOT, "scripts", "results")
+# Directory for generated scripts and results: the local TEMP work folder shared
+# with the QuietMode wrapper (connection.logs.WORK_ROOT), never the code folder,
+# which may be a read-only or shared network folder.
+from connection.logs import WORK_ROOT as _WORK_ROOT
+SCRIPT_DIR = os.path.join(_WORK_ROOT, "scripts", "generated")
+RESULTS_DIR = os.path.join(_WORK_ROOT, "scripts", "results")
 
 
 def _ensure_dirs():
@@ -142,7 +145,7 @@ def _preserve_failed_script(script_path: str):
     litter the package directory. Never raises - it runs on an error path.
     """
     try:
-        base = os.environ.get("EPLAN_MCP_LOG_DIR") or os.path.join(_MCP_ROOT, "logs")
+        base = os.environ.get("EPLAN_MCP_LOG_DIR") or os.path.join(_WORK_ROOT, "logs")
         dest_dir = os.path.join(base, "failed_scripts")
         os.makedirs(dest_dir, exist_ok=True)
         dest = os.path.join(dest_dir, os.path.basename(script_path))
@@ -1843,7 +1846,8 @@ public class McpGetSysMessages
 
 # Where caller-supplied C# is archived before it runs. Separate from the
 # generated-script directory, which is cleaned up after every execution.
-AUDIT_SCRIPT_DIR = os.path.join(_MCP_ROOT, "logs", "scripts")
+AUDIT_SCRIPT_DIR = os.path.join(
+    os.environ.get("EPLAN_MCP_LOG_DIR") or os.path.join(_WORK_ROOT, "logs"), "scripts")
 
 
 def _archive_caller_script(script_code: str):

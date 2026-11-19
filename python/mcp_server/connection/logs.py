@@ -3,6 +3,7 @@
 import json
 import logging
 import os
+import tempfile
 import time
 
 from connection.shaping import LOGGED_RESULT_KEYS
@@ -10,6 +11,12 @@ from connection.shaping import LOGGED_RESULT_KEYS
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger("EPLAN")
+
+# Work files - generated scripts, their result files, logs - live in the local
+# TEMP, never next to the code: the code folder may be a read-only or shared
+# network folder, and the server must not write into it while it runs.
+# EPLAN_MCP_LOG_DIR still overrides the log folder.
+WORK_ROOT = os.path.join(tempfile.gettempdir(), "eplan_mcp")
 
 
 def _log_dir() -> str:
@@ -22,7 +29,7 @@ def _log_dir() -> str:
     override = os.environ.get("EPLAN_MCP_LOG_DIR")
     if override:
         return override
-    return os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "logs")
+    return os.path.join(WORK_ROOT, "logs")
 
 
 class LogMixin:

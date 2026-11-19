@@ -78,7 +78,7 @@ __all__ = [
 
 # Directory for the per-batch request files; results go to
 # scripted.RESULTS_DIR like every other script's.
-OPS_DIR = os.path.join(scripted._MCP_ROOT, "scripts", "ops")
+OPS_DIR = os.path.join(scripted._WORK_ROOT, "scripts", "ops")
 
 # PLC connection point roles -> FunctionDefinition (group, id) in category
 # PLCTerminal. Measured on the Siemens S7-1200 Data Portal macro.
