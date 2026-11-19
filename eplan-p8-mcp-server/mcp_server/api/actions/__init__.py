@@ -376,6 +376,22 @@ from .live_props import (
     live_set_texts,
 )
 
+# v11 (copy / paste between projects, batch editing after the copy): pages,
+# objects, macros, device tags, function definition, articles, symbol variant,
+# compact listing and checks. Writes are scratch-only unless allow_real_project.
+from .live_copy import (
+    live_copy_pages,
+    live_copy_objects,
+    live_save_macro,
+    live_insert_page_macro,
+    live_rename_devices,
+    live_set_function_definition,
+    live_remove_function_articles,
+    live_set_symbol_variant,
+    live_list_functions,
+    live_check_connections,
+)
+
 # GED interaction (start an interactive placement in the graphical editor)
 from .interaction import (
     start_ged_interaction,
@@ -518,6 +534,10 @@ __all__ = [
     'live_insert_window_macro', 'live_set_device_tags', 'live_place_function_property',
     'live_add_function_articles', 'live_move_placements', 'live_hide_function_property',
     'live_set_texts',
+    # v11 copy / paste
+    'live_copy_pages', 'live_copy_objects', 'live_save_macro', 'live_insert_page_macro',
+    'live_rename_devices', 'live_set_function_definition', 'live_remove_function_articles',
+    'live_set_symbol_variant', 'live_list_functions', 'live_check_connections',
     # GED interaction
     'start_ged_interaction', 'insert_device', 'insert_symbol_reference',
     'select_device',
