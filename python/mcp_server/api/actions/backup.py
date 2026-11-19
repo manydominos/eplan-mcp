@@ -34,11 +34,16 @@ def backup_project(
     auto_copy_ref_data: bool = False,
     include_ext_docs: bool = False,
     include_images: bool = False,
-    backup_method: str = "BACKUP"
+    backup_method: str = "BACKUP",
+    backup_media: str = None
 ) -> dict:
     """
     Backup a project to disk.
     Action: backup
+
+    EPLAN 2.9 refuses the action without BACKUPMEDIA ("Storage medium
+    expected. Parameter name: BACKUPMEDIA"); its command line example passes
+    /BACKUPMEDIA:DISK. Pass backup_media="DISK" there.
 
     project_name is NOT truly optional here: EPLAN only falls back to the
     GUI-selected project when the action is invoked from the GUI (e.g. a
@@ -83,7 +88,20 @@ def backup_project(
         backup_method: "BACKUP" (safe default), "SOURCEOUT" (files off the
                        project — confirm with user first, unconfirmed side
                        effects on original), or "ARCHIVE"
+        backup_media: "DISK" (save to a drive) or "EMAIL", sent as
+                      BACKUPMEDIA - required by EPLAN 2.9. Default: not sent.
     """
+    media = None
+    if backup_media is not None:
+        media = str(backup_media).strip().upper()
+        if media not in ("DISK", "EMAIL"):
+            return {"success": False,
+                    "error": "backup_media must be 'DISK' or 'EMAIL', got %r." % (backup_media,)}
+        if media == "EMAIL" and str(backup_method or "").strip().upper() == "ARCHIVE":
+            return {"success": False,
+                    "error": "backup_method ARCHIVE must not be used with backup_media EMAIL "
+                             "(EPLAN backup action documentation)."}
+
     manager, error = _get_connected_manager()
     if error:
         return error
@@ -98,7 +116,8 @@ def backup_project(
         AUTOCOPYREFDATA=auto_copy_ref_data,
         INCLEXTDOCS=include_ext_docs,
         INCLIMAGES=include_images,
-        BACKUPMETHOD=backup_method
+        BACKUPMETHOD=backup_method,
+        BACKUPMEDIA=media
     )
     return manager.execute_action(action)
 
