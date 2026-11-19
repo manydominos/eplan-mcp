@@ -49,6 +49,13 @@ symbols in one call. v8 (inbox 2026-10-30_eplan_ni_orodja_dodaj_artikel_
 funkciji_brez_artikla.md): live_add_function_articles appends article
 references (module + BaseUnit) to functions, with the parts database guard.
 
+v9 (inbox 2026-10-30_eplan_skrij_property_placement.md):
+live_hide_function_property hides (or removes) the text that shows a property
+on a symbol - also the docked texts of a macro (ContextPropertyPlacement, e.g.
+Type number 22002 of the module and the BaseUnit) - without touching the symbol
+or its other texts. live_place_function_property writes the Location relative
+to the symbol's insertion point (EPLAN 2.9; v8 wrote page mm -> off the sheet).
+
 API names used on EPLAN 2.9 (eplan.help API 2.9):
     FunctionPropertyList.FUNC_PLCADDRESS                     #20400
     FunctionPropertyList.FUNC_PLCCHANNEL_DESIGNATION_MANUAL  #20407
@@ -77,6 +84,7 @@ __all__ = [
     "live_set_device_tags",
     "live_place_function_property",
     "live_add_function_articles",
+    "live_hide_function_property",
 ]
 
 
@@ -2369,6 +2377,8 @@ _PLACE_PP_BODY = '''
             bool v8dry = V8DRY;
             bool v8rollback = V8ROLLBACK;
             string v8boxsrc = V8BOXSRC;
+            string v9frame = V9FRAME;
+            bool v9allowOut = V9ALLOWOUT;
 
             // ---- 1. resolve every handle BEFORE anything is written ----------
             List<string> wanted = new List<string>(v8handles);
@@ -2380,7 +2390,11 @@ _PLACE_PP_BODY = '''
                 {
                     if (pl == null) continue;
                     string h0 = Handle(pl);
-                    if (h0 != null && wanted.Contains(h0) && !byH.ContainsKey(h0)) byH[h0] = pl;
+                    // v9: a docked ContextPropertyPlacement has the SAME handle as its box -
+                    // the symbol (it carries PropertyPlacements) wins over any other object
+                    if (h0 != null && wanted.Contains(h0) && (!byH.ContainsKey(h0) ||
+                        (!(TryRead(byH[h0], "PropertyPlacements", null) is IEnumerable) &&
+                         TryRead(pl, "PropertyPlacements", null) is IEnumerable))) byH[h0] = pl;
                 }
             }
             else
@@ -2466,7 +2480,7 @@ _PLACE_PP_BODY = '''
                 bool place = v8pos != "keep";
                 double px = 0, py = 0;
                 string jdef = "";
-                if (v8pos == "absolute") { px = v8x + v8dx; py = v8y + v8dy; }
+                if (v8pos == "absolute" || v8pos == "page") { px = v8x + v8dx; py = v8y + v8dy; }
                 else if (place)
                 {
                     string bsrc;
@@ -2483,7 +2497,49 @@ _PLACE_PP_BODY = '''
                 }
                 string just = v8just.Length > 0 ? v8just : jdef;
                 bool move = place && (action == "create" || v8repos);
-                if (move) it["targetPoint"] = XY(px, py);
+                // v9 (inbox 2026-10-30_eplan_place_function_property_relativna_lega,
+                // 2026-11-02_..._above_top_left_absolutna_v_relativno): on EPLAN 2.9 the
+                // Location of a symbol's text is RELATIVE to the symbol's insertion point.
+                // v8 wrote the page point (78; 269) there -> drawn at (156; 537), off the sheet.
+                int nRel, nPage;
+                string fGuess = PpFrameOf(fn, out nRel, out nPage);
+                string frame = v9frame != "auto" ? v9frame : (fGuess.Length > 0 ? fGuess : "relative");
+                double[] sxy = PlXY(fn);
+                double wx = px, wy = py, gx = px, gy = py;   // written Location / point on the page
+                if (move)
+                {
+                    it["locationFrame"] = frame;
+                    it["frameSource"] = v9frame != "auto" ? "explicit" : (fGuess.Length > 0
+                        ? "existing texts of the symbol: " + nRel + " relative, " + nPage + " page"
+                        : "default (EPLAN 2.9: relative to the symbol insertion point)");
+                    if (frame == "relative")
+                    {
+                        if (sxy == null)
+                            throw new Exception("Nothing changed: " + h + " has no readable Location (insertion point) - " +
+                                "pass location_frame='page' or position='absolute'.");
+                        it["symbolLocation"] = XY(sxy[0], sxy[1]);
+                        if (v8pos == "absolute") { gx = px + sxy[0]; gy = py + sxy[1]; }
+                        else { wx = px - sxy[0]; wy = py - sxy[1]; }
+                    }
+                    it["targetPoint"] = XY(gx, gy);
+                    it["writeLocation"] = XY(wx, wy);
+                    object fpg = TryRead(fn, "Page", null);
+                    object psz = fpg == null ? null : TryRead(fpg, "Size", null);
+                    if (psz != null)
+                    {
+                        Dictionary<string, object> psd = PtDict(psz);
+                        double pw = Convert.ToDouble(psd["x"]), ph = Convert.ToDouble(psd["y"]);
+                        if (pw > 1 && ph > 1)
+                        {
+                            bool inside = gx >= -0.01 && gy >= -0.01 && gx <= pw + 0.01 && gy <= ph + 0.01;
+                            it["insidePage"] = inside;
+                            if (!inside && !v9allowOut)
+                                throw new Exception("Nothing changed: OUTSIDE_PAGE - the text of " + h + " would land at (" +
+                                    Math.Round(gx, 2) + "; " + Math.Round(gy, 2) + ") on the page, outside the page " +
+                                    pw + " x " + ph + " mm (allow_outside_page=true to force).");
+                        }
+                    }
+                }
                 if (move && just.Length > 0) it["justification"] = just;
                 string hfrom;
                 double th = PpTemplateHeight(fn, idNow, out hfrom);
@@ -2495,7 +2551,7 @@ _PLACE_PP_BODY = '''
                 }
                 else if (action == "create") it["heightSource"] = "EPLAN default (no other visible property text on this symbol)";
                 items.Add(it);
-                plan.Add(new object[] { h, fn, anyId, move, px, py, just, hgt, it });
+                plan.Add(new object[] { h, fn, anyId, move, wx, wy, just, hgt, it });
             }
             if (wantId >= 0) results["propertyId"] = wantId;
             results["items"] = items;
@@ -2593,6 +2649,15 @@ _PLACE_PP_BODY = '''
                                 double tol = Math.Max(5.0, 3 * (hgt > 0 ? hgt : 2.5));
                                 it["textNearTarget"] = px >= bb[0] - tol && px <= bb[2] + tol && py >= bb[1] - tol && py <= bb[3] + tol;
                             }
+                            // v9: where the text lands on the page (Location + insertion point when relative)
+                            if (loc != null && it.ContainsKey("locationFrame"))
+                            {
+                                Dictionary<string, object> l2 = PtDict(loc);
+                                double lx = Convert.ToDouble(l2["x"]), ly = Convert.ToDouble(l2["y"]);
+                                double[] s2 = PlXY(fn);
+                                if ((string)it["locationFrame"] == "relative" && s2 != null) { lx += s2[0]; ly += s2[1]; }
+                                it["pageLocation"] = XY(lx, ly);
+                            }
                         }
                     }
                     catch (Exception ex)
@@ -2645,6 +2710,7 @@ _PP_POSITIONS = {
     "inside_top_left": (1.0, -1.0, "TopLeft"),
     "absolute": (0.0, 0.0, ""),
     "keep": (0.0, 0.0, ""),
+    "page": (0.0, 0.0, ""),      # v9: x, y in page mm (converted to the symbol's frame)
 }
 
 # TextBase.JustificationType (API 2.9)
@@ -2687,7 +2753,9 @@ def live_place_function_property(property_id: str = None, handles: list = None,
                                  relation_index: int = 1, make_local: bool = True,
                                  dry_run: bool = True, allow_real_project: bool = False,
                                  rollback_on_error: bool = True, max_items: int = 100,
-                                 timeout_seconds: float = 180.0) -> dict:
+                                 timeout_seconds: float = 180.0,
+                                 location_frame: str = "auto",
+                                 allow_outside_page: bool = False) -> dict:
     """
     v8: SHOW a property of a function on the sheet - property placement
     (Eigenschaftsplatzierung / "Eigenschaftsanordnung", display a property
@@ -2726,13 +2794,28 @@ def live_place_function_property(property_id: str = None, handles: list = None,
         position: where the NEW text goes (and an existing one when moved):
             "above_top_left" (default; justification BottomLeft, dy=+1 mm),
             "above_top_right", "below_bottom_left", "below_bottom_right",
-            "inside_top_left", "absolute" (x, y required) or "keep" (where
-            EPLAN puts it / where it is).
+            "inside_top_left", "page" (x, y in page mm), "absolute" (x, y
+            written to Location AS IS) or "keep" (where EPLAN puts it /
+            where it is).
             Relative positions use the symbol outline: GetLogicalArea, else
             GetBoundingBox (box_source "auto" / "logical_area" /
             "bounding_box"; both are reported per item).
+            v9: on EPLAN 2.9 the Location of a symbol's text is RELATIVE to
+            the symbol's insertion point (device tag of a PLC box at (-1, 0));
+            the page point is converted (minus SymbolReference.Location).
+            v8 wrote page mm there - the text landed off the sheet.
         dx, dy: offset in mm added to the point (defaults per position).
-        x, y: page mm for position="absolute".
+        x, y: page mm for position="page"; for "absolute" the raw
+            Location (on 2.9 = mm from the insertion point, e.g. x=0, y=1:
+            1 mm above the insertion point - the v8 workaround keeps working).
+        location_frame: v9. "auto" (default: the frame the symbol's other
+            texts use; no texts -> "relative", as on EPLAN 2.9),
+            "relative" or "page". Reported per item: "locationFrame",
+            "frameSource", "symbolLocation", "targetPoint" (page mm),
+            "writeLocation" (written), after the write "pageLocation".
+        allow_outside_page: v9. Default False - a text that would land
+            outside the page (Page.Size) -> nothing changed, errorType
+            OUTSIDE_PAGE ("insidePage" per item).
         height: text height in mm. Default: like the symbol's other visible
             property texts ("heightSource"); existing texts keep theirs.
         justification: TextBase.JustificationType name (BottomLeft, TopLeft,
@@ -2782,6 +2865,10 @@ def live_place_function_property(property_id: str = None, handles: list = None,
         ddx, ddy, djust = _PP_POSITIONS[pos]
         if pos == "absolute" and (x is None or y is None):
             raise SchematicValueError("position='absolute' needs x and y (page mm).")
+        if pos == "page" and (x is None or y is None):
+            raise SchematicValueError("position='page' needs x and y (page mm).")
+        if location_frame not in ("auto", "relative", "page"):
+            raise SchematicValueError("location_frame must be 'auto', 'relative' or 'page', got %r." % (location_frame,))
         just = djust
         if justification is not None:
             match = [j for j in _PP_JUSTIFICATIONS if j.lower() == str(justification).lower()]
@@ -2822,6 +2909,8 @@ def live_place_function_property(property_id: str = None, handles: list = None,
             V8DRY=cs_bool(dry_run),
             V8ROLLBACK=cs_bool(rollback_on_error),
             V8BOXSRC='"%s"' % box_source,
+            V9FRAME='"%s"' % location_frame,
+            V9ALLOWOUT=cs_bool(allow_outside_page),
         )
     except (SchematicValueError, TypeError, ValueError) as exc:
         return _err(exc)
@@ -2832,6 +2921,8 @@ def live_place_function_property(property_id: str = None, handles: list = None,
         timeout=timeout_seconds,
     ), keep=("items", "failedAt", "rolledBack", "rollbackErrors", "project"))
     if not out.get("success"):
+        if "OUTSIDE_PAGE" in str(out.get("error") or ""):
+            out["errorType"] = "OUTSIDE_PAGE"
         return out
     out["dryRun"] = bool(dry_run)
     counts, empty, warnings = {}, [], []
@@ -2845,6 +2936,9 @@ def live_place_function_property(property_id: str = None, handles: list = None,
                     it[k]["displayText"] = disp
         if "propertyValue" in it and not str(it.get("propertyValue") or "").strip():
             empty.append(it.get("name") or it.get("handle"))
+        if it.get("insidePage") is False:
+            warnings.append("%s: the text lies OUTSIDE the page (targetPoint %s; allow_outside_page)."
+                            % (it.get("name") or it.get("handle"), it.get("targetPoint")))
         if it.get("textNearTarget") is False:
             warnings.append("%s: the text was not drawn near the requested point (locationDelta %s) - check with "
                             "live_read_page(include_property_placements=True)." % (it.get("name") or it.get("handle"),
@@ -3290,4 +3384,516 @@ def live_add_function_articles(articles: list = None, handles: list = None, hand
             fa.get("partNr"), fa.get("handle"), fa.get("error"),
             "Articles added by this call were removed again." if rollback_on_error and not out.get("rollbackErrors")
             else "Articles added before it stay - check the functions."))
+    return out
+
+
+# ---------------------------------------------------------------------------
+# v9  hide / remove the text that shows a property on a symbol
+# ---------------------------------------------------------------------------
+# inbox 2026-10-30_eplan_skrij_property_placement.md (V2, ET-1): the
+# Siemens PLC boxes show "Type number" (22002, module + BaseUnit) under
+# "Siemens" as DOCKED ContextPropertyPlacement texts that carry the SAME handle
+# as the box - live_remove_placements(handles=[box]) would remove the box. This
+# tool works on the symbol's PropertyPlacements list instead.
+# API 2.9: PropertyPlacement.IsSetAsVisible (Placement.Visibility Invisible),
+# GraphicalPlacement.IsVisible, PropertyPlacement.Remove(), RelationIndex,
+# TextBase.IsDocked, SymbolReference.UseLocalPropertyPlacements /
+# SwitchLocalPropertyPlacements(bool) (texts of the symbol variant are read-only).
+
+_HELPERS_HIDE = r'''
+    // ---- v9: live_hide_function_property ----------------------------------------
+    // index > 0: DisplayedProperty.Index, or - for article texts that keep Index 0 -
+    // PropertyPlacement.RelationIndex (22002 of the 1st / 2nd article of the box).
+    static bool PpMatch(object pp, int id, int idx, string rel, int relIdx)
+    {
+        if (PpPropId(pp) != id) return false;
+        int ri = PpInt(pp, "RelationIndex", 0);
+        if (idx > 0)
+        {
+            int pi = PpPropIdx(pp);
+            if (!(pi == idx || (pi == 0 && ri == idx))) return false;
+        }
+        if (rel.Length > 0 && SafeText(TryRead(pp, "Relation", null)) != rel) return false;
+        if (relIdx > 0 && ri != relIdx) return false;
+        return true;
+    }
+
+    // Identity of a text that survives SwitchLocalPropertyPlacements (local copies).
+    static string PpSig(object pp)
+    {
+        return PpPropId(pp) + "[" + PpPropIdx(pp) + "]" + SafeText(TryRead(pp, "Relation", null)) +
+            "#" + PpInt(pp, "RelationIndex", 0);
+    }
+
+    static string PpState(object pp)
+    {
+        return PpSig(pp) + (PpShown(pp) ? " shown" : " hidden");
+    }
+
+    static Dictionary<string, object> PpBrief(object pp)
+    {
+        Dictionary<string, object> f = DumpPropPl(pp);
+        Dictionary<string, object> d = new Dictionary<string, object>();
+        foreach (string k in new string[] { "clrType", "propertyId", "propertyIndex", "relation", "relationIndex",
+                                            "propertyName", "text", "visible", "setAsVisible", "docked" })
+            if (f.ContainsKey(k)) d[k] = f[k];
+        return d;
+    }
+
+    static string PpMakeHidden(object pp)
+    {
+        List<string> routes = new List<string>();
+        PropertyInfo sv = GetWritable(pp.GetType(), "IsSetAsVisible");
+        if (sv != null && sv.PropertyType.IsEnum)
+        {
+            try { sv.SetValue(pp, Enum.Parse(sv.PropertyType, "Invisible"), null); routes.Add("IsSetAsVisible=Invisible"); }
+            catch (TargetInvocationException tie) { routes.Add("IsSetAsVisible threw " + Flatten(tie.InnerException)); }
+            catch (Exception ex) { routes.Add("IsSetAsVisible threw " + Flatten(ex)); }
+        }
+        PropertyInfo iv = GetWritable(pp.GetType(), "IsVisible");
+        if (PpShown(pp) && iv != null)
+        {
+            try { iv.SetValue(pp, false, null); routes.Add("IsVisible=false"); }
+            catch (TargetInvocationException tie) { routes.Add("IsVisible threw " + Flatten(tie.InnerException)); }
+            catch (Exception ex) { routes.Add("IsVisible threw " + Flatten(ex)); }
+        }
+        if (sv == null && iv == null)
+            throw new Exception("PropertyPlacement has neither a writable IsSetAsVisible nor IsVisible. " +
+                MemberList(pp.GetType(), false));
+        if (PpShown(pp))
+            throw new Exception("Property placement " + PpSig(pp) + " is still visible after the write (" +
+                string.Join("; ", routes.ToArray()) + "; IsSetAsVisible=" + PpVisibility(pp) + ").");
+        return string.Join("; ", routes.ToArray());
+    }
+'''
+
+
+_HIDE_PP_BODY = '''
+            string[] v9handles = V9HANDLES;
+            string v9page = V9PAGE;
+            string[] v9pnames = V9PNAMES;
+            int[] v9pidx = V9PIDX;
+            int[] v9pnum = V9PNUM;
+            string v9action = V9ACTION;
+            string v9rel = V9REL;
+            int v9relIdx = V9RELIDX;
+            bool v9local = V9LOCAL;
+            bool v9dry = V9DRY;
+            bool v9rollback = V9ROLLBACK;
+            bool v9verbose = V9VERBOSE;
+
+            // ---- 1. resolve every handle BEFORE anything is written ----------
+            // A docked ContextPropertyPlacement carries the SAME handle as its box -
+            // only an object with PropertyPlacements (the symbol) is taken.
+            List<string> wanted = new List<string>(v9handles);
+            Dictionary<string, object> byH = new Dictionary<string, object>();
+            if (v9page.Length > 0)
+            {
+                object pg = FindPage(project, v9page);
+                foreach (object pl in PagePlacements(pg))
+                {
+                    if (pl == null) continue;
+                    string h0 = Handle(pl);
+                    if (h0 != null && wanted.Contains(h0) && !byH.ContainsKey(h0) &&
+                        TryRead(pl, "PropertyPlacements", null) is IEnumerable) byH[h0] = pl;
+                }
+            }
+            else
+            {
+                foreach (object fn in AllFunctions(project))
+                {
+                    if (fn == null) continue;
+                    string h0 = Handle(fn);
+                    if (h0 != null && wanted.Contains(h0) && !byH.ContainsKey(h0)) byH[h0] = fn;
+                    if (byH.Count == wanted.Count) break;
+                }
+            }
+            List<string> missing = new List<string>();
+            foreach (string h in wanted) if (!byH.ContainsKey(h)) missing.Add(h);
+            if (missing.Count > 0)
+                throw new Exception("Nothing changed: " + missing.Count + " symbol handle(s) not found" +
+                    (v9page.Length > 0 ? " on page '" + v9page + "'" : " among the project's functions") + ": " +
+                    string.Join(", ", missing.ToArray()) + ". Handles are session-scoped - re-read them " +
+                    "(live_read_function_properties / live_read_page).");
+            foreach (string h in wanted)
+                if (!(TryRead(byH[h], "PropertyPlacements", null) is IEnumerable))
+                    throw new Exception("Nothing changed: " + h + " is a " + byH[h].GetType().Name +
+                        " - only symbols (SymbolReference: functions, PLC boxes, terminals ...) carry property placements.");
+
+            // ---- 2. plan: per symbol, the texts of the properties ------------
+            List<object> items = new List<object>();
+            List<object[]> plan = new List<object[]>();
+            foreach (string h in wanted)
+            {
+                object fn = byH[h];
+                Dictionary<string, object> it = new Dictionary<string, object>();
+                it["handle"] = h;
+                it["clrType"] = fn.GetType().Name;
+                string nm = SafeText(TryRead(fn, "Name", null));
+                if (nm != null && nm.Length > 0) it["name"] = nm;
+                List<int[]> specs = new List<int[]>();
+                List<string> labels = new List<string>();
+                for (int k = 0; k < v9pnum.Length; k++)
+                {
+                    int id = v9pnum[k];
+                    if (id < 0)
+                    {
+                        object props = FnProps(fn);
+                        PropertyInfo pi = FnPropInfo(props, v9pnames[k], v9pidx[k]);
+                        if (pi == null)
+                            throw new Exception("Nothing changed: " + props.GetType().Name + " of " + h + " declares no '" +
+                                v9pnames[k] + "'. A property number (e.g. 22002) is accepted too.");
+                        object pv;
+                        try { pv = v9pidx[k] > 0 ? pi.GetValue(props, new object[] { v9pidx[k] }) : pi.GetValue(props, null); }
+                        catch (TargetInvocationException tie) { throw new Exception("Nothing changed: reading " + v9pnames[k] + " of " + h + ": " + Flatten(tie.InnerException)); }
+                        object anyId = pv == null ? null : TryRead(pv, "Id", null);
+                        id = PpInt(anyId, "AsInt", -1);
+                        if (id < 0) throw new Exception("Nothing changed: " + v9pnames[k] + " of " + h + " gives no PropertyValue.Id.AsInt.");
+                    }
+                    int[] sp = new int[2];
+                    sp[0] = id; sp[1] = v9pidx[k];
+                    specs.Add(sp);
+                    labels.Add((v9pnames[k].Length > 0 ? v9pnames[k] : id.ToString()) + (v9pidx[k] > 0 ? "[" + v9pidx[k] + "]" : ""));
+                }
+                List<object> hits = new List<object>();
+                List<string> othersBefore = new List<string>();
+                int[] perSpec = new int[specs.Count];
+                int total = 0, toWrite = 0;
+                foreach (object pp in (IEnumerable)TryRead(fn, "PropertyPlacements", null))
+                {
+                    if (pp == null) continue;
+                    total++;
+                    int hitAt = -1;
+                    for (int k = 0; k < specs.Count; k++)
+                        if (PpMatch(pp, specs[k][0], specs[k][1], v9rel, v9relIdx)) { hitAt = k; break; }
+                    if (hitAt < 0) { othersBefore.Add(PpState(pp)); continue; }
+                    perSpec[hitAt]++;
+                    Dictionary<string, object> d = v9verbose ? DumpPropPl(pp) : PpBrief(pp);
+                    string act = v9action == "remove" ? "remove" : (PpShown(pp) ? "hide" : "alreadyHidden");
+                    if (act != "alreadyHidden") toWrite++;
+                    d["action"] = act;
+                    hits.Add(d);
+                }
+                List<string> nf = new List<string>();
+                for (int k = 0; k < specs.Count; k++) if (perSpec[k] == 0) nf.Add(labels[k]);
+                if (nf.Count > 0) it["notFound"] = nf;
+                it["texts"] = total;
+                it["matched"] = hits;
+                it["useLocalPropertyPlacements"] = ReadBool(fn, "UseLocalPropertyPlacements", true);
+                it["action"] = hits.Count == 0 ? "notFound" : (toWrite > 0 ? v9action : "alreadyHidden");
+                items.Add(it);
+                plan.Add(new object[] { h, fn, specs, othersBefore, it, toWrite > 0 });
+            }
+            results["items"] = items;
+            results["dryRun"] = v9dry;
+
+            // ---- 3. write (one LockingStep, all or nothing with rollback) ---
+            if (!v9dry)
+            {
+                List<object[]> undo = new List<object[]>();   // {kind, object, property, old value}
+                List<string> notRestorable = new List<string>();
+                Dictionary<string, object> failedAt = null;
+                foreach (object[] p in plan)
+                {
+                    string h = (string)p[0];
+                    object fn = p[1];
+                    List<int[]> specs = (List<int[]>)p[2];
+                    List<string> othersBefore = (List<string>)p[3];
+                    Dictionary<string, object> it = (Dictionary<string, object>)p[4];
+                    if (!(bool)p[5]) { it["result"] = (string)it["action"]; continue; }
+                    string step = "start";
+                    bool switched = false;
+                    try
+                    {
+                        // Texts of the symbol VARIANT cannot be changed - local copies first
+                        // (as live_place_function_property; the drawing does not change).
+                        if (!ReadBool(fn, "UseLocalPropertyPlacements", true))
+                        {
+                            if (!v9local)
+                                throw new Exception("the symbol uses its variant's property placements and make_local=false");
+                            step = "SwitchLocalPropertyPlacements(true)";
+                            Call(RequireMethod(fn.GetType(), "SwitchLocalPropertyPlacements", new string[] { "Boolean" }, false), fn, new object[] { true });
+                            undo.Add(new object[] { "local", fn, null, null });
+                            switched = true;
+                            it["switchedToLocal"] = true;
+                        }
+                        step = "find";
+                        List<object> targets = new List<object>();
+                        foreach (object pp in (IEnumerable)TryRead(fn, "PropertyPlacements", null))
+                        {
+                            if (pp == null) continue;
+                            foreach (int[] sp in specs)
+                                if (PpMatch(pp, sp[0], sp[1], v9rel, v9relIdx)) { targets.Add(pp); break; }
+                        }
+                        int nHidden = 0, nRemoved = 0;
+                        foreach (object pp in targets)
+                        {
+                            if (v9action == "remove")
+                            {
+                                step = "Remove";
+                                if (!switched) notRestorable.Add(h + " " + PpSig(pp));
+                                Call(RequireMethod(pp.GetType(), "Remove", new string[] { }, false), pp, null);
+                                nRemoved++;
+                            }
+                            else if (PpShown(pp))
+                            {
+                                step = "hide";
+                                undo.Add(new object[] { "set", pp, "IsSetAsVisible", TryRead(pp, "IsSetAsVisible", null) });
+                                undo.Add(new object[] { "set", pp, "IsVisible", TryRead(pp, "IsVisible", null) });
+                                it["hiddenRoute"] = PpMakeHidden(pp);
+                                nHidden++;
+                            }
+                        }
+                        // ---- read back: the property is no longer shown, nothing else changed
+                        step = "verify";
+                        List<string> othersAfter = new List<string>();
+                        List<string> stillShown = new List<string>();
+                        int remaining = 0;
+                        foreach (object pp in (IEnumerable)TryRead(fn, "PropertyPlacements", null))
+                        {
+                            if (pp == null || !IsValidObj(pp)) continue;
+                            bool hit = false;
+                            foreach (int[] sp in specs) if (PpMatch(pp, sp[0], sp[1], v9rel, v9relIdx)) { hit = true; break; }
+                            if (!hit) { othersAfter.Add(PpState(pp)); continue; }
+                            remaining++;
+                            if (PpShown(pp)) stillShown.Add(PpSig(pp));
+                        }
+                        othersBefore.Sort(StringComparer.Ordinal);
+                        othersAfter.Sort(StringComparer.Ordinal);
+                        bool same = string.Join("|", othersBefore.ToArray()) == string.Join("|", othersAfter.ToArray());
+                        it["othersUnchanged"] = same;
+                        if (!same)
+                        {
+                            it["othersBefore"] = othersBefore;
+                            it["othersAfter"] = othersAfter;
+                            throw new Exception("other texts of the symbol changed (count or visibility) - see othersBefore / othersAfter");
+                        }
+                        if (stillShown.Count > 0)
+                            throw new Exception("still shown after the write: " + string.Join(", ", stillShown.ToArray()));
+                        if (v9action == "remove" && remaining > 0)
+                            throw new Exception(remaining + " text(s) of the property still exist after Remove");
+                        if (!IsValidObj(fn) || Handle(fn) != h)
+                            throw new Exception("the symbol itself is no longer valid");
+                        it["symbolKept"] = true;
+                        it["verified"] = true;
+                        it["result"] = v9action == "remove" ? "removed" : "hidden";
+                        if (nHidden > 0) it["hiddenCount"] = nHidden;
+                        if (nRemoved > 0) it["removedCount"] = nRemoved;
+                        if (v9verbose) it["after"] = DumpPropPls(fn, 200);
+                    }
+                    catch (Exception ex)
+                    {
+                        failedAt = new Dictionary<string, object>();
+                        failedAt["handle"] = h;
+                        failedAt["step"] = step;
+                        failedAt["error"] = Flatten(ex);
+                        break;
+                    }
+                }
+                if (failedAt != null)
+                {
+                    results["failedAt"] = failedAt;
+                    if (notRestorable.Count > 0) results["notRestorable"] = notRestorable;
+                    if (v9rollback)
+                    {
+                        List<string> rbErr = new List<string>();
+                        int rb = 0;
+                        for (int k = undo.Count - 1; k >= 0; k--)
+                        {
+                            object[] u = undo[k];
+                            try
+                            {
+                                string kind = (string)u[0];
+                                if (kind == "local")
+                                    Call(RequireMethod(u[1].GetType(), "SwitchLocalPropertyPlacements", new string[] { "Boolean" }, false), u[1], new object[] { false });
+                                else if (IsValidObj(u[1]) && !object.Equals(TryRead(u[1], (string)u[2], null), u[3]))
+                                    PpRestore(u[1], (string)u[2], u[3]);   // only what really changed
+                                rb++;
+                            }
+                            catch (Exception exr) { rbErr.Add(Flatten(exr)); }
+                        }
+                        results["rolledBack"] = rb;
+                        if (rbErr.Count > 0) results["rollbackErrors"] = rbErr;
+                    }
+                }
+            }
+'''
+
+
+_HIDE_ACTIONS = ("hide", "remove")
+
+
+def _hide_specs(property_id):
+    """'22002' / '22002[2]' / '22002[*]' / 'FUNC_X' / 'FUNC_X[1]' / 22002 / list of them
+    -> [(name, index, number)]; index 0 = every index of the property."""
+    vals = list(property_id) if isinstance(property_id, (list, tuple)) else [property_id]
+    if not vals:
+        raise SchematicValueError("property_id: give at least one property.")
+    if len(vals) > 20:
+        raise SchematicValueError("property_id: at most 20 properties in one call, got %d." % len(vals))
+    out = []
+    for v in vals:
+        if isinstance(v, str) and v.strip().endswith("[*]"):
+            v = v.strip()[:-3]
+        spec = _pp_property(v)
+        if spec not in out:
+            out.append(spec)
+    return out
+
+
+def live_hide_function_property(property_id=None, handles: list = None, handle: str = None,
+                                page: str = None, action: str = "hide", relation: str = None,
+                                relation_index: int = None, make_local: bool = True,
+                                dry_run: bool = True, allow_real_project: bool = False,
+                                rollback_on_error: bool = True, max_items: int = 100,
+                                verbose: bool = False, timeout_seconds: float = 180.0) -> dict:
+    """
+    v9: HIDE (or remove) the text that shows a property of a symbol on the
+    sheet - property placement (Eigenschaftsplatzierung), the counterpart of
+    live_place_function_property. Hides the property TEXT only: the symbol
+    (PLC box, function, terminal), its other texts, the property VALUE,
+    articles and connections stay. WRITES (unless dry_run, the default) -
+    scratch-only unless allow_real_project=True (dry_run only reads).
+
+    Works on the symbol's own list (SymbolReference.PropertyPlacements), so it
+    also reaches the DOCKED texts of a macro (clrType ContextPropertyPlacement,
+    e.g. "Type number" 22002 of the module and of the BaseUnit under
+    "Siemens" on an ET 200SP box). Those carry the SAME handle as the box in
+    live_read_page - never pass that handle to live_remove_placements (it
+    would remove the box).
+
+    For each symbol given by handle and each text of the property:
+      - shown  -> hidden: IsSetAsVisible=Invisible (+ IsVisible=false)
+        ("hidden"; also for texts set ByLayer - the layer is NOT changed),
+      - already hidden -> nothing ("alreadyHidden"),
+      - action="remove" -> PropertyPlacement.Remove() ("removed").
+    A symbol that uses its variant's texts (UseLocalPropertyPlacements false)
+    is switched to local texts first (SwitchLocalPropertyPlacements(true),
+    the drawing does not change) - make_local=False refuses instead.
+    Many symbols in ONE call (handles=[...], one LockingStep); every handle
+    and property is checked before the first write; read back per symbol:
+    no text of the property is shown any more ("verified"), every other text
+    keeps its visibility ("othersUnchanged"), the symbol is still there
+    ("symbolKept") - else everything of this call is undone
+    (rollback_on_error; a hidden text gets its old visibility back, a symbol
+    switched to local texts goes back to its variant's texts).
+
+    Args:
+        property_id: the property - a number as string or int ("22002"),
+            optionally indexed ("22002[1]", "22002[2]"; "22002" or "22002[*]"
+            = every index), or a FunctionPropertyList name
+            ("FUNC_PLCGROUP_STARTADDRESS_1_INPUTS", "FUNC_X[2]"); or a LIST of
+            them (up to 20), e.g. ["22002", "FUNC_PLCGROUP_STARTADDRESS_1_INPUTS",
+            "FUNC_PLCGROUP_STARTADDRESS_1_OUTPUTS"]. The index matches
+            DisplayedProperty.Index, or - for article texts with Index 0 -
+            PropertyPlacement.RelationIndex (1st / 2nd article).
+        handles / handle: the SYMBOLS (box / function handles from
+            live_read_page or live_read_function_properties; session-scoped).
+            At most max_items (default 100).
+        page: optional - resolve the handles on this page only.
+        action: "hide" (default) or "remove". Remove cannot be undone on a
+            symbol that already had local texts ("notRestorable") - prefer hide.
+        relation, relation_index: optional filters (PropertyPlacement.Relation
+            name, e.g. "MainFunctionArticle"; RelationIndex).
+        make_local: see above (default True).
+        dry_run: default True - per symbol "matched" texts with "action"
+            (hide / alreadyHidden / remove), "notFound"; nothing changed.
+        allow_real_project: must be True to write outside the scratch root.
+        rollback_on_error: default True.
+        verbose: full text records (as live_read_page) and "after" per symbol.
+        timeout_seconds: default 180.
+
+    Returns:
+        {"success", "dryRun", "action", "counts" {per symbol result/action: n},
+         "textsMatched", "textsHidden"/"textsRemoved", "items": [{handle, name,
+         clrType, texts, matched [{propertyId, propertyIndex, relation,
+         relationIndex, text, visible, setAsVisible, docked, action}],
+         notFound, useLocalPropertyPlacements, action, and after a real run:
+         result hidden/removed/alreadyHidden/notFound, verified, othersUnchanged,
+         symbolKept, switchedToLocal}], "warnings"}. A failed write: success
+        false, errorType "ROLLED_BACK" (or "PARTIAL"), "failedAt" {handle,
+        step, error}. Check with live_read_page(...,
+        include_property_placements=True): the text has visible false.
+    """
+    try:
+        specs = _hide_specs(property_id)
+        if handles is not None and not isinstance(handles, (list, tuple)):
+            raise SchematicValueError("handles must be a list of strings (use handle= for one).")
+        hl = []
+        for v in ([handle] if handle else []) + list(handles or []):
+            if not isinstance(v, str) or not v.strip():
+                raise SchematicValueError("handles entries must be non-empty strings, got %r." % (v,))
+            if v.strip() not in hl:
+                hl.append(v.strip())
+        if not hl:
+            raise SchematicValueError("Pass handle='...' or handles=[...] (symbols from live_read_page / "
+                                      "live_read_function_properties).")
+        mx = cs_int(max_items, "max_items", minimum=1, maximum=500)
+        if len(hl) > mx:
+            raise SchematicValueError("%d handles, more than max_items=%d - nothing changed." % (len(hl), mx))
+        if action not in _HIDE_ACTIONS:
+            raise SchematicValueError("action must be 'hide' or 'remove', got %r." % (action,))
+        rel = ""
+        if relation:
+            if not isinstance(relation, str) or not _PP_IDENT.match(relation.strip()):
+                raise SchematicValueError("relation must be a PropertyPlacement.RelationType name, got %r." % (relation,))
+            rel = relation.strip()
+        rix = 0 if relation_index is None else cs_int(relation_index, "relation_index", minimum=1, maximum=999)
+        body = ("" if dry_run else _guard_prelude(allow_real_project)) + _fill(
+            _HIDE_PP_BODY,
+            V9HANDLES=_cs_str_array(hl),
+            V9PAGE='"%s"' % cs_escape(cs_text(page, "page", allow_empty=True)),
+            V9PNAMES=_cs_str_array([n for n, _, _ in specs]),
+            V9PIDX=_cs_int_array([i for _, i, _ in specs]),
+            V9PNUM=_cs_int_array([n for _, _, n in specs]),
+            V9ACTION='"%s"' % action,
+            V9REL='"%s"' % rel,
+            V9RELIDX=str(rix),
+            V9LOCAL=cs_bool(make_local),
+            V9DRY=cs_bool(dry_run),
+            V9ROLLBACK=cs_bool(rollback_on_error),
+            V9VERBOSE=cs_bool(verbose),
+        )
+    except (SchematicValueError, TypeError, ValueError) as exc:
+        return _err(exc)
+
+    out = _shape_keep(_execute_script(
+        _script(_cls("HideProp"), body,
+                extra_helpers=_HELPERS_SCHEMATIC + _HELPERS_PROPS + _HELPERS_PP + _HELPERS_HIDE),
+        timeout=timeout_seconds,
+    ), keep=("items", "failedAt", "rolledBack", "rollbackErrors", "notRestorable", "project"))
+    if not out.get("success"):
+        return out
+    out["dryRun"] = bool(dry_run)
+    out["action"] = action
+    counts, warnings, nf = {}, [], []
+    matched = written = 0
+    for it in out.get("items") or []:
+        key = it.get("result") or it.get("action") or "?"
+        counts[key] = counts.get(key, 0) + 1
+        for t in it.get("matched") or []:
+            matched += 1
+            if t.get("action") in ("hide", "remove"):
+                written += 1
+            disp, _ = multilang_display(t.get("text"))
+            if disp is not None:
+                t["displayText"] = disp
+        if it.get("notFound"):
+            nf.append("%s: %s" % (it.get("name") or it.get("handle"), ", ".join(it["notFound"])))
+    out["counts"] = counts
+    out["textsMatched"] = matched
+    out["textsRemoved" if action == "remove" else "textsHidden"] = written
+    if nf:
+        warnings.append("No text of the property on %d symbol(s) (nothing to hide there): %s"
+                        % (len(nf), "; ".join(nf[:20])))
+    if warnings:
+        out["warnings"] = warnings
+    if out.get("failedAt"):
+        out["success"] = False
+        out["errorType"] = "ROLLED_BACK" if rollback_on_error else "PARTIAL"
+        fa = out["failedAt"]
+        out["error"] = ("Writing failed at %s (step %s): %s. %s" % (
+            fa.get("handle"), fa.get("step"), fa.get("error"),
+            "All changes of this call were undone." if rollback_on_error and not out.get("rollbackErrors")
+            and not out.get("notRestorable") else "Some changes stay - check the page."))
     return out

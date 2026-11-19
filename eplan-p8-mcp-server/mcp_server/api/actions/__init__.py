@@ -372,6 +372,7 @@ from .live_props import (
     live_set_device_tags,
     live_place_function_property,
     live_add_function_articles,
+    live_hide_function_property,
 )
 
 # GED interaction (start an interactive placement in the graphical editor)
@@ -514,7 +515,7 @@ __all__ = [
     'live_place_corner', 'live_place_tnode', 'live_place_connected',
     'live_read_function_properties', 'live_set_function_properties',
     'live_insert_window_macro', 'live_set_device_tags', 'live_place_function_property',
-    'live_add_function_articles', 'live_move_placements',
+    'live_add_function_articles', 'live_move_placements', 'live_hide_function_property',
     # GED interaction
     'start_ged_interaction', 'insert_device', 'insert_symbol_reference',
     'select_device',

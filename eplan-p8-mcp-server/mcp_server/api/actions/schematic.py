@@ -19,6 +19,10 @@ Six primitives, in the order a caller uses them:
 v8: live_read_page(include_property_placements=True) also returns the texts
 that show a symbol's properties (PropertyPlacement); the writer is
 live_props.live_place_function_property.
+
+v9: a property text's Location is RELATIVE to its symbol's insertion point
+(EPLAN 2.9) - live_move_placements no longer moves such texts a
+second time; live_read_page also reports relationIndex.
 v8: live_move_placements moves placements (one macro / device, a list, a
 rectangle) by setting Placement.Location - nothing removed or re-inserted.
 
@@ -792,6 +796,8 @@ _HELPERS_SCHEMATIC = r'''
         if (dk != null) { try { d["docked"] = Convert.ToBoolean(dk); } catch { } }
         object rel = TryRead(pp, "Relation", null);
         if (rel != null) d["relation"] = SafeText(rel);
+        object rix = TryRead(pp, "RelationIndex", null);   // v9
+        if (rix != null) { try { int r = Convert.ToInt32(rix); if (r > 0) d["relationIndex"] = r; } catch { } }
         return d;
     }
 
@@ -814,6 +820,62 @@ _HELPERS_SCHEMATIC = r'''
             }
         }
         return list;
+    }
+
+    // ---- v9: frame of a symbol text's Location ---------------------------------
+    // EPLAN 2.9 (live V2): PropertyPlacement.Location of a symbol's texts
+    // is RELATIVE to the symbol's insertion point (SymbolReference.Location) - the
+    // device tag of a PLC box from a macro reads (-1,0). Used by
+    // live_place_function_property (write) and live_move_placements (no 2nd move).
+    static double[] PlXY(object pl)
+    {
+        object loc = pl == null ? null : TryRead(pl, "Location", null);
+        if (loc == null) return null;
+        try
+        {
+            Dictionary<string, object> d = PtDict(loc);
+            double[] r = new double[2];
+            r[0] = Convert.ToDouble(d["x"]); r[1] = Convert.ToDouble(d["y"]);
+            return r;
+        }
+        catch { return null; }
+    }
+
+    static double DistToBox(double x, double y, double[] b)
+    {
+        double dx = x < b[0] ? b[0] - x : (x > b[2] ? x - b[2] : 0);
+        double dy = y < b[1] ? b[1] - y : (y > b[3] ? y - b[3] : 0);
+        return Math.Sqrt(dx * dx + dy * dy);
+    }
+
+    // true: Location l of a text of the symbol inserted at s (box = its outline on
+    // the page) reads as relative - l + s lies at least as near the outline as l.
+    static bool PpLooksRelative(double[] l, double[] s, double[] box)
+    {
+        if (l == null || s == null || box == null) return false;
+        return DistToBox(l[0] + s[0], l[1] + s[1], box) <= DistToBox(l[0], l[1], box);
+    }
+
+    // The frame the symbol's existing texts use: "relative" / "page" / "" (no
+    // evidence: no texts, or the insertion point so near the origin that both read alike).
+    static string PpFrameOf(object sr, out int nRel, out int nPage)
+    {
+        nRel = 0; nPage = 0;
+        double[] s = PlXY(sr);
+        double[] box = BBoxOf(sr);
+        object arr = TryRead(sr, "PropertyPlacements", null);
+        if (s == null || box == null || !(arr is IEnumerable)) return "";
+        foreach (object pp in (IEnumerable)arr)
+        {
+            if (pp == null) continue;
+            double[] l = PlXY(pp);
+            if (l == null) continue;
+            double dr = DistToBox(l[0] + s[0], l[1] + s[1], box), dp = DistToBox(l[0], l[1], box);
+            if (Math.Abs(dr - dp) < 1.0) continue;
+            if (dr < dp) nRel++; else nPage++;
+        }
+        if (nRel == 0 && nPage == 0) return "";
+        return nRel >= nPage ? "relative" : "page";
     }
 '''
 
@@ -4719,6 +4781,7 @@ _MOVE_BODY = '''
                 Dictionary<string, object> failedAt = null;
                 List<string> notShifted = new List<string>();
                 int ppFollowed = 0, ppMoved = 0, ppOther = 0;
+                int ppRelative = 0;   // v9
                 double mtol = 0.05;
                 foreach (string h in mv)
                 {
@@ -4746,6 +4809,17 @@ _MOVE_BODY = '''
                             double[] was = (double[])q[1];
                             double[] now = LocXY(q[0]);
                             if (now == null) continue;
+                            // v9 (inbox 2026-10-30_eplan_move_placements_dvojni_premik_napisov_skatle):
+                            // a text whose Location is RELATIVE to its symbol (EPLAN 2.9: the texts of a
+                            // PLC box, device tag (-1,0)) follows the symbol with the SAME Location;
+                            // v8 took the unchanged value for 'did not follow' and moved it twice.
+                            if (PpLooksRelative(was, oldLoc[h], ob))
+                            {
+                                if (Near(now[0], was[0], mtol) && Near(now[1], was[1], mtol)) { ppFollowed++; ppRelative++; }
+                                else if (Near(now[0], was[0] + mvdx, mtol) && Near(now[1], was[1] + mvdy, mtol)) ppFollowed++;
+                                else ppOther++;
+                                continue;
+                            }
                             if (Near(now[0], was[0] + mvdx, mtol) && Near(now[1], was[1] + mvdy, mtol)) { ppFollowed++; continue; }
                             if (V8MOVEPP && Near(now[0], was[0], mtol) && Near(now[1], was[1], mtol))
                             {
@@ -4777,6 +4851,7 @@ _MOVE_BODY = '''
                 if (notShifted.Count > 0) results["notShiftedAsExpected"] = notShifted;
                 Dictionary<string, object> ppr = new Dictionary<string, object>();
                 ppr["followed"] = ppFollowed; ppr["movedExplicitly"] = ppMoved; ppr["other"] = ppOther;
+                if (ppRelative > 0) ppr["relativeKept"] = ppRelative;
                 results["propertyTexts"] = ppr;
                 if (failedAt != null)
                 {
@@ -4874,7 +4949,11 @@ def live_move_placements(page: str, handles: list = None, region: list = None,
             rolled back on error. Omit to stay on the page.
         move_property_texts: a symbol's property texts (device tag, ...) that
             did not follow the symbol are moved by the same offset (default
-            True; "propertyTexts" {followed, movedExplicitly, other}).
+            True; "propertyTexts" {followed, movedExplicitly, other,
+            relativeKept}). v9: a text whose Location is RELATIVE to its
+            symbol's insertion point (EPLAN 2.9: the texts of a PLC box from a
+            macro, device tag at (-1, 0)) follows the symbol by itself and is
+            never moved again ("relativeKept"; v8 moved those twice).
         allow_overlap: default False - a moved box overlapping another box
             already on the page -> refused (errorType OVERLAP,
             "overlapsExistingBoxes").
