@@ -2,6 +2,10 @@
 Project management actions.
 """
 
+import datetime
+import os
+import uuid
+
 from ._base import _get_connected_manager, _build_action
 from . import _project_cache
 
@@ -357,8 +361,15 @@ def get_current_project() -> dict:
     Get the current project path.
     Action: selectionset (TYPE:PROJECT)
 
-    The result is returned in the calling context parameter "PROJECT"
-    (full project path with .elk extension).
+    The action returns its result in the calling context parameter
+    "PROJECT", which the remote API does not hand back - so v6 adds the path
+    from the live object model (inbox 2026-10-28_eplan_get_current_project_brez_poti.md):
+    "projectOpen" (false = no project open, then "projectPath" is null),
+    "projectPath" (the .elk), "projectName", "projectDirectory" and
+    "databaseLastWrite" / "databaseLastWriteFile" - the newest file in the
+    project's .edb folder. EPLAN writes changes to that database itself;
+    there is no separate save command (.edb written right after
+    the last change), so this is the check that a change has been stored.
 
     IMPORTANT: This only reports whichever single project currently has
     focus/is active in EPLAN. If the user has multiple projects open at
@@ -374,7 +385,72 @@ def get_current_project() -> dict:
         "selectionset",
         TYPE="PROJECT"
     )
-    return manager.execute_action(action)
+    result = manager.execute_action(action)
+    if isinstance(result, dict):
+        result = dict(result)
+        try:
+            result.update(_live_project_path())
+        except Exception as exc:  # noqa: BLE001 - the action result stays usable
+            result["projectPathError"] = str(exc)
+    return result
+
+
+_PROJECT_PATH_BODY = '''
+            foreach (string pn in new string[] { "ProjectLinkFilePath", "ProjectFullName", "ProjectDirectoryPath" })
+            {
+                PropertyInfo pi = GetReadable(project.GetType(), pn);
+                if (pi == null) continue;
+                try
+                {
+                    object v = pi.GetValue(project, null);
+                    if (v != null) results[pn] = v.ToString();
+                }
+                catch { }
+            }
+            results["success"] = true;
+'''
+
+
+def _database_last_write(elk_path, max_files=20000):
+    """Newest file of <project>.edb: (ISO time, relative file) or (None, None)."""
+    base = elk_path[:-4] if elk_path.lower().endswith(".elk") else elk_path
+    edb = base + ".edb"
+    if not os.path.isdir(edb):
+        return None, None
+    newest, newest_f, seen = None, None, 0
+    for d, _dirs, files in os.walk(edb):
+        for f in files:
+            seen += 1
+            if seen > max_files:
+                break
+            try:
+                m = os.path.getmtime(os.path.join(d, f))
+            except OSError:
+                continue
+            if newest is None or m > newest:
+                newest, newest_f = m, os.path.relpath(os.path.join(d, f), edb)
+    if newest is None:
+        return None, None
+    return datetime.datetime.fromtimestamp(newest).isoformat(timespec="seconds"), newest_f
+
+
+def _live_project_path():
+    """v6: path of the focused project from the live object model."""
+    from .live import _script
+    from .scripted import _execute_script
+    raw = _execute_script(_script("PrjPath_" + uuid.uuid4().hex[:8], _PROJECT_PATH_BODY), timeout=30.0)
+    inner = raw.get("results") if isinstance(raw, dict) else None
+    if not isinstance(inner, dict) or inner.get("success") is False:
+        msg = str((inner or {}).get("error") or (raw or {}).get("message") or (raw or {}).get("error") or "")
+        if "No project is currently open" in msg:
+            return {"projectOpen": False, "projectPath": None}
+        return {"projectPath": None, "projectPathError": msg or "script returned no result"}
+    path = inner.get("ProjectLinkFilePath") or inner.get("ProjectFullName")
+    out = {"projectOpen": True, "projectPath": path, "projectName": inner.get("project"),
+           "projectDirectory": inner.get("ProjectDirectoryPath")}
+    if path:
+        out["databaseLastWrite"], out["databaseLastWriteFile"] = _database_last_write(path)
+    return out
 
 
 def set_project_language(

@@ -33,6 +33,15 @@ PLC connection points, PLC boxes and every other Function subclass, one by
 handle or many in one call, validated before the first write, verified and
 rolled back on error (inbox 2026-10-28_eplan_bmk_plc_prikljucka_in_skatle.md).
 
+v6 (inbox 2026-10-28/29, live test v5): live_set_device_tags sets the
+DISPLAYED device tag too (NameService.AdjustVisibleName / VisibleName - v5
+showed 510S1 as "-S1"), renames boxes before their PLC points (points take
+the box's tag, no nested 500S1-500S1:1), detects merges without the sign "-",
+evaluates the touched pages and reports other renamed functions; compact
+answers by default (verbose=True for everything); live_insert_window_macro
+reports every renamed existing function and box overlap; replace_article
+(auto) refuses a part number that is not in the parts database.
+
 API names used on EPLAN 2.9 (eplan.help API 2.9):
     FunctionPropertyList.FUNC_PLCADDRESS                     #20400
     FunctionPropertyList.FUNC_PLCCHANNEL_DESIGNATION_MANUAL  #20407
@@ -459,6 +468,266 @@ _HELPERS_PROPS = r'''
         List<string> after = ConnDesignations(FnProps(fn));
         return after.Count >= idx ? after[idx - 1] : "";
     }
+
+    // ---- v6: device tag forms (inbox 2026-10-29_eplan_vidni_bmk_brez_stevilke.md,
+    //      2026-10-28_eplan_set_device_tags_spoj_ni_zaznan.md) -----------------
+    // "-510K3" / "510K3" -> "510K3": the device tag without the preceding sign.
+    // EPLAN stores "510K3" for a requested "-510K3" - the same device.
+    static string NormDt(string dt)
+    {
+        if (dt == null) return "";
+        return dt.Trim().TrimStart('-');
+    }
+
+    // The device tag WITHOUT project structures: "=AB-C+WAGO-510S1" -> "510S1".
+    // A nested tag stays nested: "-500S1-500S1" -> "500S1-500S1".
+    static string DevPart(string dt)
+    {
+        string s = dt == null ? "" : dt.Trim();
+        int plus = s.LastIndexOf('+');
+        if (plus >= 0)
+        {
+            string rest = s.Substring(plus + 1);
+            int d1 = rest.IndexOf('-');
+            return d1 < 0 ? "" : rest.Substring(d1 + 1);
+        }
+        if (s.StartsWith("="))
+        {
+            int d2 = s.LastIndexOf('-');
+            return d2 < 0 ? "" : s.Substring(d2 + 1);
+        }
+        return s.TrimStart('-');
+    }
+
+    // Same device: equal without the sign, or equal without structures when
+    // one side carries none (V2 names have no structure: "510K3:9").
+    static bool SameDevice(string a, string b)
+    {
+        if (a == null) a = "";
+        if (b == null) b = "";
+        if (string.Equals(NormDt(a), NormDt(b), StringComparison.OrdinalIgnoreCase)) return NormDt(a).Length > 0;
+        bool aStruct = a.IndexOf('=') >= 0 || a.IndexOf('+') >= 0;
+        bool bStruct = b.IndexOf('=') >= 0 || b.IndexOf('+') >= 0;
+        if (aStruct && bStruct) return false;
+        string pa = DevPart(a), pb = DevPart(b);
+        return pa.Length > 0 && string.Equals(pa, pb, StringComparison.OrdinalIgnoreCase);
+    }
+
+    // v6: new device tag in the structure of the old one. Unlike ComposeDt (v5)
+    // no "-" is added when the old tag has none ("K1" of a window macro, "510K3"
+    // in V2); a tag with '=' / '+' is taken whole.
+    static string ComposeDtV6(string oldDt, string tag)
+    {
+        if (tag.IndexOf('=') >= 0 || tag.IndexOf('+') >= 0) return tag;
+        int dash = oldDt == null ? -1 : oldDt.LastIndexOf('-');
+        if (dash < 0) return tag;
+        return oldDt.Substring(0, dash) + "-" + tag.TrimStart('-');
+    }
+
+    // ":9" of "510K3:9" must survive the rename (as requested).
+    static bool SuffixOk(string after, string wantName, string newDt)
+    {
+        if (after == null) after = "";
+        string want = wantName.Length >= newDt.Length ? wantName.Substring(newDt.Length) : "";
+        string got = after.Substring(DtPart(after).Length);
+        return string.Equals(want, got, StringComparison.OrdinalIgnoreCase);
+    }
+
+    // v6: the DISPLAYED device tag (what the page shows above a box):
+    // FUNC_VISIBLEDEVICETAG (#20010, read-only), else FunctionBase.VisibleName.
+    static string VisibleDt(object fn)
+    {
+        try
+        {
+            object props = FnProps(fn);
+            string t;
+            if (ReadFnProp(props, "FUNC_VISIBLEDEVICETAG", 0, out t) && t != null && !t.StartsWith("<error"))
+                return t;
+        }
+        catch { }
+        string v = PropText(fn, "VisibleName");
+        return v == null ? "" : v;
+    }
+
+    // v6: displayed tag names the requested device (sign / structures aside),
+    // or is empty because the function takes the tag of its box (a PLC point
+    // inside its PLC box) and its name already is the requested one.
+    static bool VisibleOk(object fn, string newDt)
+    {
+        string vis = VisibleDt(fn);
+        if (SameDevice(DtPart(vis), newDt)) return true;
+        if (NormDt(vis).Length == 0) return SameDevice(DtPart(PropText(fn, "Name")), newDt);
+        return false;
+    }
+
+    // ---- v6: NameService (Eplan.EplApi.HEServices, API 2.9) ------------------
+    // Keeps full name, visible name AND visible name format consistent - what
+    // the property dialog does. v5 set only FunctionBase.Name: the visible
+    // format of the macro tag "-K1" (identifier + counter) stayed, so "510S1"
+    // was displayed as "-S1" (prefix 510 dropped).
+    static Type _nsType;
+
+    static object NewNameService(object page)
+    {
+        if (_nsType == null) _nsType = FindType("Eplan.EplApi.HEServices.NameService");
+        if (_nsType == null) throw new Exception("Eplan.EplApi.HEServices.NameService not found.");
+        object ns = null;
+        foreach (ConstructorInfo ci in _nsType.GetConstructors())
+        {
+            ParameterInfo[] ps = ci.GetParameters();
+            if (ps.Length == 1 && page != null && ps[0].ParameterType.IsAssignableFrom(page.GetType()))
+            {
+                try { ns = ci.Invoke(new object[] { page }); }
+                catch (TargetInvocationException tie) { throw new Exception("new NameService(Page): " + Flatten(tie.InnerException)); }
+                break;
+            }
+        }
+        if (ns == null)
+        {
+            ns = Activator.CreateInstance(_nsType);
+            PropertyInfo pp = GetWritable(_nsType, "Page");
+            if (pp != null && page != null) pp.SetValue(ns, page, null);
+        }
+        // As interactive editing: the visible name carries no structures equal
+        // to the page / box and no device tag equal to the surrounding box - a
+        // PLC point then TAKES the box's tag instead of nesting its own under it
+        // (500S1-500S1:1, inbox 2026-10-29_..._ugnezdi_prikljucke_...).
+        SetBoolIfPresent(ns, "RemovalOfUnnecessaryProjectStructuresIsEnabled", true);
+        SetBoolIfPresent(ns, "RemovalOfUnnecessaryDeviceTagNamePartsIsEnabled", true);
+        return ns;
+    }
+
+    static void SetBoolIfPresent(object o, string name, bool value)
+    {
+        PropertyInfo pi = GetWritable(o.GetType(), name);
+        if (pi == null) return;
+        try { pi.SetValue(o, value, null); } catch { }
+    }
+
+    static object FnPage(object fn) { return TryRead(fn, "Page", null); }
+
+    static bool HasNsMethod(object ns, string method)
+    {
+        return MethodByShape(ns.GetType(), method, new string[] { "Page", "FunctionBase" }, false) != null
+            || MethodByShape(ns.GetType(), method, new string[] { "FunctionBase" }, false) != null;
+    }
+
+    // NameService.<method>(Page, FunctionBase), else (FunctionBase).
+    static string NsCall(object ns, string method, object page, object fn)
+    {
+        MethodInfo mi = page == null ? null
+            : MethodByShape(ns.GetType(), method, new string[] { "Page", "FunctionBase" }, false);
+        if (mi != null)
+        {
+            object r1 = Call(mi, ns, new object[] { page, fn });
+            return "NameService." + method + "(Page,FunctionBase)" + (r1 is bool && !(bool)r1 ? "=false" : "");
+        }
+        mi = RequireMethod(ns.GetType(), method, new string[] { "FunctionBase" }, false);
+        object r2 = Call(mi, ns, new object[] { fn });
+        return "NameService." + method + "(FunctionBase)" + (r2 is bool && !(bool)r2 ? "=false" : "");
+    }
+
+    // The function whose name a function without its own visible device tag
+    // takes over (its PLC box / black box), or null.
+    static object NameGiver(object ns, object fn)
+    {
+        if (ns == null) return null;
+        try
+        {
+            object pg = FnPage(fn);
+            MethodInfo mi = pg == null ? null
+                : MethodByShape(ns.GetType(), "FindNameGivingFunction", new string[] { "Page", "Function" }, false);
+            if (mi != null) return mi.Invoke(ns, new object[] { pg, fn });
+            mi = MethodByShape(ns.GetType(), "FindNameGivingFunction", new string[] { "Function" }, false);
+            if (mi != null) return mi.Invoke(ns, new object[] { fn });
+        }
+        catch { }
+        return null;
+    }
+
+    // Visible name route: as typing the displayed tag in the dialog, then the
+    // full name evaluated from it. Empty = take the tag of the box.
+    static string SetVisibleAndAdjust(object ns, object fn, string visible)
+    {
+        PropertyInfo vp = GetWritable(fn.GetType(), "VisibleName");
+        if (vp == null)
+            throw new Exception(fn.GetType().Name + " has no writable VisibleName. " + MemberList(fn.GetType(), false));
+        try { vp.SetValue(fn, visible, null); }
+        catch (TargetInvocationException tie)
+        { throw new Exception("VisibleName = '" + visible + "' on " + fn.GetType().Name + ": " + Flatten(tie.InnerException)); }
+        return "FunctionBase.VisibleName('" + visible + "') + " + NsCall(ns, "AdjustFullName", FnPage(fn), fn);
+    }
+
+    // v6: one function's device tag; returns the route taken.
+    //   "name"    FunctionBase.Name only (v5 behaviour)
+    //   "auto"    Name, then NameService.AdjustVisibleName (visible name and
+    //             its format from the full name); if the displayed tag still
+    //             differs: VisibleName + NameService.AdjustFullName
+    //   "visible" VisibleName + NameService.AdjustFullName
+    static string WriteDeviceTag(object ns, string mode, object fn, string wantName, string newDt, string tag)
+    {
+        string route = "";
+        if (mode != "visible")
+        {
+            route = SetFunctionName(fn, wantName);
+            string after = PropText(fn, "Name");
+            if (after == null) after = "";
+            string wantSuffix = wantName.Length >= newDt.Length ? wantName.Substring(newDt.Length) : "";
+            if (wantSuffix.Length > 1 && SameDevice(DtPart(after), newDt) && !SuffixOk(after, wantName, newDt))
+            {
+                object props2 = FnProps(fn);
+                if (GetPropInfo(props2.GetType(), "FUNC_ADDITIONALIDENTIFYINGNAMEPART") != null)
+                    route += " + FUNC_ADDITIONALIDENTIFYINGNAMEPART " +
+                        SetLiveProp(props2, "FUNC_ADDITIONALIDENTIFYINGNAMEPART", wantSuffix.Substring(1));
+            }
+            if (mode == "name") return route;
+            route += " + " + NsCall(ns, "AdjustVisibleName", FnPage(fn), fn);
+            if (VisibleOk(fn, newDt)) return route;
+            route += " | displayed '" + VisibleDt(fn) + "' -> ";
+        }
+        object giver = NameGiver(ns, fn);
+        string vis = (giver != null && SameDevice(DtPart(PropText(giver, "Name")), newDt)) ? "" : tag;
+        return route + SetVisibleAndAdjust(ns, fn, vis);
+    }
+
+    // v6: functions (not in `skip`) whose name changed since `before`.
+    static List<object> RenamedOthers(List<object> all, Dictionary<string, string> before,
+                                      List<string> skip, List<string> followDts, int max, out int total)
+    {
+        List<object> list = new List<object>();
+        total = 0;
+        foreach (object fn in all)
+        {
+            string h = Handle(fn);
+            if (h == null || skip.Contains(h)) continue;
+            string was;
+            if (!before.TryGetValue(h, out was)) continue;
+            string now = PropText(fn, "Name");
+            if (now == null) now = "";
+            if (now == was) continue;
+            total++;
+            if (list.Count >= max) continue;
+            Dictionary<string, object> d = new Dictionary<string, object>();
+            d["handle"] = h;
+            d["page"] = FnPageName(fn);
+            d["nameBefore"] = was;
+            d["nameAfter"] = now;
+            bool follows = false;
+            foreach (string f in followDts)
+                if (SameDevice(DtPart(was), f)) { follows = true; break; }
+            d["followsRenamedDevice"] = follows;
+            list.Add(d);
+        }
+        return list;
+    }
+
+    // v6: a placement that bounds other functions (PLC box, black box ...).
+    static bool IsBoxLike(object o)
+    {
+        if (o == null || IsGraphicObject(o)) return false;
+        string t = o.GetType().Name;
+        return t == "PLC" || t.EndsWith("Box");
+    }
 '''
 
 
@@ -609,13 +878,29 @@ def _verify_by_display_text(details):
                 p["newDisplay"] = disp
 
 
+def _article_in_db(part_nr, allow_unverified_db=False):
+    """v6: True / False when the parts database answered, None when it could not tell."""
+    try:
+        raw = _scripted.parts_db_get_part(part_nr, allow_unverified_db=allow_unverified_db)
+    except Exception:  # noqa: BLE001 - undecided, never a crash of the write
+        return None
+    if not isinstance(raw, dict) or raw.get("success") is False:
+        return None
+    res = raw.get("results") if isinstance(raw.get("results"), dict) else raw
+    if res.get("success") is False:
+        return None
+    found = res.get("found")
+    return found if isinstance(found, bool) else None
+
+
 def live_set_function_properties(values: dict = None, name: str = None, handle: str = None,
                                  page: str = None, connection_designation: str = None,
                                  replace_article: dict = None, limit: int = 1,
                                  allow_real_project: bool = False,
                                  timeout_seconds: float = 120.0,
                                  replace_article_mode: str = "auto",
-                                 allow_unverified_db: bool = False) -> dict:
+                                 allow_unverified_db: bool = False,
+                                 allow_missing_article: bool = False) -> dict:
     """
     Set FunctionPropertyList values of functions in the open project. WRITES -
     scratch-only unless allow_real_project=True.
@@ -652,14 +937,20 @@ def live_set_function_properties(values: dict = None, name: str = None, handle: 
             reads the parts database - keep timeout_seconds short.
         allow_unverified_db: v5, as in parts_db_*: with "auto", try even when
             the preflight cannot decide.
+        allow_missing_article: v6, only with "auto". The new part number is
+            looked up in the parts database first (as parts_db_get_part); not
+            found -> errorType ARTICLE_NOT_IN_DB, nothing written (EPLAN would
+            write a reference without description / manufacturer). True writes
+            it anyway. "articleInDb" reports the lookup (null = undecided).
 
     Returns:
         {"success", "project", "matched", "modified", "details": [{"name",
          "handle", "page", "properties": [{"property", "previous", "requested",
          "new", "verified", "route"}], "article": {"from", "to", "previous",
-         "after", "route"}}]}. "previous" makes every edit reversible. A failure
-        mid-way keeps "details" of what was already written. Not saved -
-        the change is on EPLAN's undo stack until the project is saved.
+         "after", "route"}}], "articleInDb"}. "previous" makes every edit
+        reversible. A failure mid-way keeps "details" of what was already
+        written. EPLAN stores the change in the project database itself (no
+        save command; get_current_project reports "databaseLastWrite").
     """
     try:
         if not handle and not name:
@@ -707,6 +998,19 @@ def live_set_function_properties(values: dict = None, name: str = None, handle: 
                     "without a database check. Otherwise the parts database must be "
                     "made available (64-bit ACE / SQL) - a user decision.")
             return out
+
+    in_db = None
+    if art_from and art_mode == "auto":
+        # v6 (inbox 2026-10-28_eplan_replace_article_ni_v_bazi.md): live test v5 A2
+        # wrote SIE.6ES7155-6BA01-0CN0, which the parts database does not hold.
+        in_db = _article_in_db(art_to, allow_unverified_db)
+        if in_db is False and not allow_missing_article:
+            return {"success": False, "errorType": "ARTICLE_NOT_IN_DB", "nothingWritten": True,
+                    "articleInDb": False, "replaceArticleMode": art_mode,
+                    "error": ("replace_article NOT run, nothing written: %r is not in the parts "
+                              "database (parts_db_get_part: found false). EPLAN would write an "
+                              "article reference without description / manufacturer. Pass "
+                              "allow_missing_article=true to write it anyway." % art_to)}
 
     body = _guard_prelude(allow_real_project) + '''
             bool projectOnly = PROJECTONLY;
@@ -892,6 +1196,14 @@ def live_set_function_properties(values: dict = None, name: str = None, handle: 
         out["errorType"] = "ARTICLE_NOT_IN_PROJECT"
     if art_from:
         out["replaceArticleMode"] = art_mode
+        if art_mode == "auto":
+            out["articleInDb"] = in_db
+            if out.get("success") and in_db is not True:
+                out["articleWarning"] = (
+                    "%r was written although it is NOT in the parts database (allow_missing_article)."
+                    % art_to if in_db is False else
+                    "Could not tell whether %r is in the parts database (lookup failed) - check "
+                    "with parts_db_get_part." % art_to)
     if out.get("success"):
         _verify_by_display_text(out.get("details"))
         bad = [p["property"] for d in out.get("details") or []
@@ -911,11 +1223,73 @@ def live_set_function_properties(values: dict = None, name: str = None, handle: 
 # M-5  window macro
 # ---------------------------------------------------------------------------
 
+def _is_box(pl):
+    """v6: a placement that bounds other functions (PLC box, black box ...)."""
+    t = str((pl or {}).get("clrType") or "")
+    return t == "PLC" or t.endswith("Box")
+
+
+def _bbox(pls):
+    """v6: union {"min": {x, y}, "max": {x, y}} of the placements' bounding boxes, or None."""
+    xs, ys = [], []
+    for pl in pls or []:
+        for p in (pl or {}).get("boundingBox") or []:
+            try:
+                xs.append(float(p["x"]))
+                ys.append(float(p["y"]))
+            except (KeyError, TypeError, ValueError):
+                continue
+    if not xs:
+        return None
+    return {"min": {"x": min(xs), "y": min(ys)}, "max": {"x": max(xs), "y": max(ys)}}
+
+
+def _overlap(a, b):
+    return bool(a and b and a["min"]["x"] < b["max"]["x"] and b["min"]["x"] < a["max"]["x"]
+                and a["min"]["y"] < b["max"]["y"] and b["min"]["y"] < a["max"]["y"])
+
+
+def _macro_checks(out):
+    """v6: bounding box of the whole insert, overlap with existing boxes, outside the page."""
+    inserted = out.get("inserted") or []
+    box = _bbox(inserted)
+    out["boundingBox"] = box
+    new_boxes = [pl for pl in inserted if _is_box(pl)]
+    out["boxes"] = [{k: pl.get(k) for k in ("handle", "name", "clrType")} for pl in new_boxes]
+    warnings = []
+    mine = [b for b in (_bbox([pl]) for pl in new_boxes) if b] or ([box] if box else [])
+    hits = []
+    for ex in out.get("existingBoxes") or []:
+        eb = _bbox([ex])
+        if eb and any(_overlap(m, eb) for m in mine):
+            hits.append("%s %s [%s]" % (ex.get("clrType"), ex.get("name"), ex.get("handle")))
+    if hits:
+        out["overlapsExistingBoxes"] = hits
+        warnings.append(
+            "The macro overlaps existing box(es) %s - EPLAN nests the device tags of functions "
+            "inside a box (K1 -> K1-K1, live test v5 A1). Remove the page or the placements "
+            "and insert elsewhere." % ", ".join(hits))
+    size = out.get("pageSize") or {}
+    try:
+        w, h = float(size.get("x")), float(size.get("y"))
+    except (TypeError, ValueError):
+        w = h = None
+    if box and w and h and (box["min"]["x"] < 0 or box["min"]["y"] < 0
+                            or box["max"]["x"] > w or box["max"]["y"] > h):
+        out["outsidePage"] = True
+        warnings.append("Bounding box %s reaches outside the page (0..%g x 0..%g mm)." % (box, w, h))
+    if out.get("renamedExisting"):
+        warnings.append("EPLAN renamed %d existing function(s) - see renamedExisting."
+                        % (out.get("renamedExistingCount") or len(out["renamedExisting"])))
+    return warnings
+
+
 def live_insert_window_macro(page: str, macro_path: str, x: float, y: float,
                              variant: int = 0, move_kind: str = "absolute",
                              allow_real_project: bool = False,
                              timeout_seconds: float = 120.0,
-                             include_graphics: bool = False) -> dict:
+                             include_graphics: bool = False,
+                             verbose: bool = False) -> dict:
     """
     Insert a window macro (.ema) on a page at a coordinate. WRITES -
     scratch-only unless allow_real_project=True.
@@ -928,7 +1302,16 @@ def live_insert_window_macro(page: str, macro_path: str, x: float, y: float,
 
     Device tags come from the macro (and the project's numbering settings).
     A tag that already exists elsewhere in the project MERGES into that
-    device - "duplicateNames" lists them; retag with live_set_device_tag.
+    device - "duplicateNames" lists them; retag with live_set_device_tags
+    (rename only the PLC box: its points take the box's tag).
+
+    v6: "renamedExisting" lists EVERY existing function EPLAN renamed by the
+    insert (compared by handle, before/after), "duplicateNames" every inserted
+    device tag that existing functions carry (sign "-" ignored). A macro whose
+    box overlaps an existing PLC / black box ("overlapsExistingBoxes": EPLAN
+    nests tags, K1 -> K1-K1) or reaches outside the page ("outsidePage") is
+    reported in "warnings". Compact by default: verbose=True adds every inserted
+    placement ("inserted") and the existing boxes ("existingBoxes").
 
     Args:
         page: Exact page name, e.g. "=AB-C+WAGO/900".
@@ -942,16 +1325,21 @@ def live_insert_window_macro(page: str, macro_path: str, x: float, y: float,
         include_graphics: v4. False (default) lists only non-graphic objects in
             "inserted" (functions, PLC boxes, terminals, ...) and counts the
             graphics (lines, arcs, ...) in "graphicsOmitted"; True lists all.
+            Only with verbose=True.
+        verbose: v6. False (default): no "inserted" / "existingBoxes" lists.
 
     Returns:
         {"success", "project", "page", "pageType", "boundSignature",
-         "insertedCount" (all objects), "listedCount", "inserted": [placement
-         as in live_read_page], "graphicsOmitted": {type: count},
-         "functionNames" (every inserted Function incl. PLC boxes and
-         terminals), "duplicateNames": {name: count of functions that existed
-         BEFORE the insert and now carry that name}, "renamedExisting":
-         [{"handle", "nameBefore", "nameAfter"}] (existing functions renamed by
-         the merge), "placementsBefore", "placementsAfter", "warning"}
+         "insertedCount" (all objects), "listedCount", "graphicsOmitted":
+         {type: count}, "functionNames" (every inserted Function incl. PLC
+         boxes and terminals), "boxes": [{"handle", "name", "clrType"}],
+         "boundingBox": {"min", "max"}, "pageSize", "duplicateNames":
+         {device tag: count of functions that existed BEFORE the insert and
+         carry it}, "renamedExisting": [{"handle", "page", "nameBefore",
+         "nameAfter"}], "renamedExistingCount", "overlapsExistingBoxes",
+         "outsidePage", "placementsBefore", "placementsAfter", "warnings";
+         verbose: + "inserted": [placement as in live_read_page],
+         "existingBoxes"}
     """
     try:
         page_cs = cs_escape(cs_text(page, "page"))
@@ -975,6 +1363,8 @@ def live_insert_window_macro(page: str, macro_path: str, x: float, y: float,
             object page = FindPage(project, PAGENAME);
             results["page"] = PropText(page, "Name");
             results["pageType"] = PropText(page, "PageType");
+            object psize = TryRead(page, "Size", null);
+            if (psize != null) { try { results["pageSize"] = PtDict(psize); } catch { } }
 
             // v4: names of all functions BEFORE the insert, by handle - a merge
             // can rename an existing function (=+-K1 -> =CA1+EAA-K1).
@@ -988,8 +1378,16 @@ def live_insert_window_macro(page: str, macro_path: str, x: float, y: float,
                 namesBefore[h0] = n0 == null ? "" : n0;
             }
             int before = 0;
-            foreach (object pl in PagePlacements(page)) if (pl != null) before++;
+            List<object> boxesBefore = new List<object>();
+            foreach (object pl in PagePlacements(page))
+            {
+                if (pl == null) continue;
+                before++;
+                // v6: existing boxes on the page - overlap check (Python side).
+                if (IsBoxLike(pl)) boxesBefore.Add(DumpPlacement(pl, false));
+            }
             results["placementsBefore"] = before;
+            results["existingBoxes"] = boxesBefore;
 
             Type insType = FindType("Eplan.EplApi.HEServices.Insert");
             MethodInfo wm = RequireMethod(insType, "WindowMacro",
@@ -1052,34 +1450,52 @@ def live_insert_window_macro(page: str, macro_path: str, x: float, y: float,
             if (!withGraphics) results["graphicsOmitted"] = graphics;
             results["functionNames"] = fnNames;
 
-            // v4: a duplicate is a function that existed BEFORE the insert and
-            // now carries an inserted name (also when the merge renamed it).
+            // v6 (inbox 2026-10-28_eplan_window_macro_renamedexisting_prazno.md):
+            // EVERY existing function whose name changed (by handle), and every
+            // existing function that carries / carried an inserted device tag.
+            List<string> insDts = new List<string>();
+            foreach (string fnN in fnNames)
+            {
+                string dtI = NormDt(DtPart(fnN));
+                if (dtI.Length > 0 && !insDts.Contains(dtI)) insDts.Add(dtI);
+            }
             Dictionary<string, object> dup = new Dictionary<string, object>();
             List<object> renamed = new List<object>();
-            if (fnNames.Count > 0)
+            int renamedTotal = 0;
+            foreach (object fn in AllFunctions(project))
             {
-                foreach (object fn in AllFunctions(project))
+                if (fn == null) continue;
+                string h = Handle(fn);
+                if (h == null || fnHandles.Contains(h)) continue;
+                string was;
+                if (!namesBefore.TryGetValue(h, out was)) continue;
+                string n = PropText(fn, "Name");
+                if (n == null) n = "";
+                if (was != n)
                 {
-                    if (fn == null) continue;
-                    string h = Handle(fn);
-                    if (h == null || fnHandles.Contains(h)) continue;
-                    string was;
-                    if (!namesBefore.TryGetValue(h, out was)) continue;
-                    string n = PropText(fn, "Name");
-                    if (n == null || !fnNames.Contains(n)) continue;
-                    dup[n] = dup.ContainsKey(n) ? (int)dup[n] + 1 : 1;
-                    if (was != n && renamed.Count < 50)
+                    renamedTotal++;
+                    if (renamed.Count < 200)
                     {
                         Dictionary<string, object> rd = new Dictionary<string, object>();
                         rd["handle"] = h;
+                        rd["page"] = FnPageName(fn);
                         rd["nameBefore"] = was;
                         rd["nameAfter"] = n;
                         renamed.Add(rd);
                     }
                 }
+                foreach (string dtI in insDts)
+                {
+                    if (SameDevice(DtPart(n), dtI) || SameDevice(DtPart(was), dtI))
+                    {
+                        dup[dtI] = dup.ContainsKey(dtI) ? (int)dup[dtI] + 1 : 1;
+                        break;
+                    }
+                }
             }
             results["duplicateNames"] = dup;
             results["renamedExisting"] = renamed;   // v5: always a list ([] = none)
+            results["renamedExistingCount"] = renamedTotal;
 
             int after = 0;
             foreach (object pl in PagePlacements(page)) if (pl != null) after++;
@@ -1105,8 +1521,15 @@ def live_insert_window_macro(page: str, macro_path: str, x: float, y: float,
         if out.get("duplicateNames"):
             out["duplicateWarning"] = (
                 "Inserted device tag(s) already exist elsewhere in the project and "
-                "are merged into those devices: %s. Retag with live_set_device_tag "
+                "are merged into those devices: %s. Retag with live_set_device_tags "
                 "if that is not intended." % ", ".join(sorted(out["duplicateNames"])))
+        warnings = _macro_checks(out)
+        if warnings:
+            out["warnings"] = warnings
+        if not verbose:
+            for k in ("inserted", "existingBoxes"):
+                out.pop(k, None)
+            out["detailsOmitted"] = "inserted placements and existing boxes: verbose=true"
     return out
 
 
@@ -1171,6 +1594,8 @@ _SET_TAGS_BODY = '''
             bool dryRun = DRYRUN;
             bool allowMerge = ALLOWMERGE;
             bool rollback = ROLLBACK;
+            string nameRoute = NAMEROUTE;
+            bool evalPages = EVALPAGES;
             string[] iHandle = IHANDLE;
             string[] iName = INAME;
             string[] iPage = IPAGE;
@@ -1179,12 +1604,23 @@ _SET_TAGS_BODY = '''
             string[] iNewConn = INEWCONN;
             bool[] iDevice = IDEVICE;
             results["dryRun"] = dryRun;
+            results["nameRoute"] = nameRoute;
 
             // One walk over the project; Terminal / PLC / ... included.
             List<object> all = new List<object>();
             foreach (object fn0 in AllFunctions(project))
                 if (fn0 != null && IsFunctionObject(fn0)) all.Add(fn0);
             results["functionsScanned"] = all.Count;
+
+            // v6: every name BEFORE, by handle - what else EPLAN renames.
+            Dictionary<string, string> nameBefore = new Dictionary<string, string>();
+            foreach (object fn0 in all)
+            {
+                string h0 = Handle(fn0);
+                if (h0 == null || nameBefore.ContainsKey(h0)) continue;
+                string n0 = PropText(fn0, "Name");
+                nameBefore[h0] = n0 == null ? "" : n0;
+            }
 
             // 1. Resolve every item to exactly one function (scope device: to
             //    every function with that device tag). Nothing is written yet.
@@ -1213,7 +1649,7 @@ _SET_TAGS_BODY = '''
                 {
                     string dt0 = DtPart(PropText(m[0], "Name"));
                     foreach (object fn in all)
-                        if (string.Equals(DtPart(PropText(fn, "Name")), dt0, StringComparison.OrdinalIgnoreCase)) group.Add(fn);
+                        if (string.Equals(NormDt(DtPart(PropText(fn, "Name"))), NormDt(dt0), StringComparison.OrdinalIgnoreCase)) group.Add(fn);
                 }
                 else group.Add(m[0]);
                 foreach (object fn in group)
@@ -1229,8 +1665,9 @@ _SET_TAGS_BODY = '''
                 }
             }
 
-            // 2. Plan: new device tag in the old structure, ":designation"
-            //    suffix kept (or moved to the new connection designation).
+            // 2. Plan: new device tag in the old structure (v6: no "-" added to
+            //    a tag that had none), ":designation" suffix kept (or moved to
+            //    the new connection designation).
             int n = tFn.Count;
             string[] prevName = new string[n];
             string[] newDt = new string[n];
@@ -1247,7 +1684,7 @@ _SET_TAGS_BODY = '''
                 prevName[k] = nm;
                 string dt = DtPart(nm);
                 string suffix = nm.Substring(dt.Length);
-                newDt[k] = ComposeDt(dt, iTag[i]);
+                newDt[k] = ComposeDtV6(dt, iTag[i]);
                 connIdx[k] = 0;
                 prevConn[k] = "";
                 if (iNewConn[i].Length > 0)
@@ -1269,6 +1706,7 @@ _SET_TAGS_BODY = '''
                 pd["page"] = FnPageName(fn);
                 pd["clrType"] = fn.GetType().Name;
                 pd["previousName"] = nm;
+                pd["visibleBefore"] = VisibleDt(fn);
                 pd["newName"] = wantName[k];
                 if (connIdx[k] > 0)
                 {
@@ -1282,6 +1720,8 @@ _SET_TAGS_BODY = '''
 
             // 3. Merges: a new device tag that other functions (not renamed
             //    here) already carry makes these functions part of that device.
+            //    v6: compared without the sign "-" and, when one side has no
+            //    structure, without structures ("-510K3" = "510K3").
             Dictionary<string, int> exCount = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
             Dictionary<string, List<string>> exSample = new Dictionary<string, List<string>>(StringComparer.OrdinalIgnoreCase);
             foreach (object fn in all)
@@ -1289,7 +1729,7 @@ _SET_TAGS_BODY = '''
                 string h = Handle(fn);
                 if (tHandle.Contains(h)) continue;
                 string nmE = PropText(fn, "Name");
-                string dtE = DtPart(nmE);
+                string dtE = NormDt(DtPart(nmE));
                 if (dtE.Length == 0) continue;
                 if (!exCount.ContainsKey(dtE)) { exCount[dtE] = 0; exSample[dtE] = new List<string>(); }
                 exCount[dtE] = exCount[dtE] + 1;
@@ -1298,13 +1738,21 @@ _SET_TAGS_BODY = '''
             Dictionary<string, object> merges = new Dictionary<string, object>();
             for (int k = 0; k < n; k++)
             {
-                string key = newDt[k];
+                string key = NormDt(newDt[k]);
                 if (merges.ContainsKey(key)) continue;
-                if (string.Equals(key, DtPart(prevName[k]), StringComparison.OrdinalIgnoreCase)) continue;
-                if (!exCount.ContainsKey(key)) continue;
+                if (SameDevice(newDt[k], DtPart(prevName[k]))) continue;
+                int cnt = 0;
+                List<string> ex = new List<string>();
+                foreach (KeyValuePair<string, int> kv in exCount)
+                {
+                    if (!SameDevice(kv.Key, newDt[k])) continue;
+                    cnt += kv.Value;
+                    foreach (string s in exSample[kv.Key]) if (ex.Count < 5) ex.Add(s);
+                }
+                if (cnt == 0) continue;
                 Dictionary<string, object> md = new Dictionary<string, object>();
-                md["existingFunctions"] = exCount[key];
-                md["examples"] = exSample[key];
+                md["existingFunctions"] = cnt;
+                md["examples"] = ex;
                 merges[key] = md;
             }
             results["merges"] = merges;
@@ -1321,22 +1769,49 @@ _SET_TAGS_BODY = '''
             // 4. Write, read back, verify; on an error roll back what was written.
             if (!dryRun)
             {
+                // v6: boxes (every non-terminal) first, PLC points after - a
+                // point inside a renamed box then takes over the box's tag.
+                List<int> order = new List<int>();
+                for (int k0 = 0; k0 < n; k0++) if (tFn[k0].GetType().Name != "Terminal") order.Add(k0);
+                for (int k0 = 0; k0 < n; k0++) if (tFn[k0].GetType().Name == "Terminal") order.Add(k0);
+
+                object ns = null;
+                if (n > 0 && (nameRoute != "name" || evalPages))
+                {
+                    try { ns = NewNameService(FnPage(tFn[order[0]])); }
+                    catch (Exception exNs)
+                    {
+                        if (nameRoute != "name")
+                            throw new Exception("NameService not available - nothing written: " + Flatten(exNs));
+                    }
+                    if (ns != null && nameRoute == "auto" && !HasNsMethod(ns, "AdjustVisibleName"))
+                        throw new Exception("NameService has no AdjustVisibleName - nothing written. " + MemberList(ns.GetType(), true));
+                    if (ns != null && nameRoute != "name" && !HasNsMethod(ns, "AdjustFullName"))
+                        throw new Exception("NameService has no AdjustFullName - nothing written. " + MemberList(ns.GetType(), true));
+                }
+
                 List<object> details = new List<object>();
                 List<object> undo = new List<object>();
                 results["details"] = details;
                 results["undo"] = undo;
                 bool[] nameTouched = new bool[n];
                 bool[] connTouched = new bool[n];
+                List<object> touchedPages = new List<object>();
+                List<string> touchedPageNames = new List<string>();
                 int modified = 0;
-                int k = 0;
+                int k = -1;
                 try
                 {
-                    for (k = 0; k < n; k++)
+                    for (int pos = 0; pos < n; pos++)
                     {
+                        k = order[pos];
                         object fn = tFn[k];
                         int i = tItem[k];
                         Dictionary<string, object> d = new Dictionary<string, object>((Dictionary<string, object>)plan[k]);
                         details.Add(d);
+                        object pg = FnPage(fn);
+                        string pgName = FnPageName(fn);
+                        if (pg != null && !touchedPageNames.Contains(pgName)) { touchedPageNames.Add(pgName); touchedPages.Add(pg); }
                         if (connIdx[k] > 0)
                         {
                             connTouched[k] = true;
@@ -1347,34 +1822,26 @@ _SET_TAGS_BODY = '''
                                     "', requested '" + iNewConn[i] + "'.");
                         }
                         nameTouched[k] = true;
-                        string route = SetFunctionName(fn, wantName[k]);
+                        string route = WriteDeviceTag(ns, nameRoute, fn, wantName[k], newDt[k], iTag[i]);
                         string after = PropText(fn, "Name");
                         if (after == null) after = "";
-                        string wantSuffix = wantName[k].Substring(newDt[k].Length);
-                        if (wantSuffix.Length > 1
-                            && string.Equals(DtPart(after), newDt[k], StringComparison.OrdinalIgnoreCase)
-                            && after.Substring(DtPart(after).Length) != wantSuffix)
-                        {
-                            object props2 = FnProps(fn);
-                            if (GetPropInfo(props2.GetType(), "FUNC_ADDITIONALIDENTIFYINGNAMEPART") != null)
-                            {
-                                route += " + FUNC_ADDITIONALIDENTIFYINGNAMEPART " +
-                                    SetLiveProp(props2, "FUNC_ADDITIONALIDENTIFYINGNAMEPART", wantSuffix.Substring(1));
-                                after = PropText(fn, "Name");
-                                if (after == null) after = "";
-                            }
-                        }
+                        string vis = VisibleDt(fn);
                         d["route"] = route;
                         d["name"] = after;
+                        d["visibleDeviceTag"] = vis;
                         d["visibleName"] = PropText(fn, "VisibleName");
                         bool exact = string.Equals(after, wantName[k], StringComparison.OrdinalIgnoreCase);
-                        bool dtOk = string.Equals(DtPart(after), newDt[k], StringComparison.OrdinalIgnoreCase);
-                        bool shortOk = string.Equals(ShortTag(DtPart(after)), ShortTag(newDt[k]), StringComparison.OrdinalIgnoreCase);
-                        d["verified"] = exact || dtOk || shortOk;
-                        if (!exact && dtOk) d["verifiedBy"] = "deviceTag";
-                        if (!exact && !dtOk && shortOk) d["verifiedBy"] = "shortTag";
-                        if (!exact && !dtOk && !shortOk)
+                        bool nameOk = SameDevice(DtPart(after), newDt[k]) && SuffixOk(after, wantName[k], newDt[k]);
+                        bool visOk = VisibleOk(fn, newDt[k]);
+                        if (nameOk && NormDt(vis).Length == 0) d["takesTagFromBox"] = true;
+                        d["visibleVerified"] = visOk;
+                        d["verified"] = nameOk && (visOk || nameRoute == "name");
+                        if (nameOk && !exact) d["verifiedBy"] = "sameDevice";
+                        if (!nameOk)
                             throw new Exception("Item " + i + ": EPLAN stored '" + after + "' for requested '" + wantName[k] + "'.");
+                        if (!visOk && nameRoute != "name")
+                            throw new Exception("Item " + i + ": displayed device tag is '" + vis + "' for requested '" +
+                                iTag[i] + "' (name '" + after + "', route " + route + ").");
                         Dictionary<string, object> u = new Dictionary<string, object>();
                         u["handle"] = tHandle[k];
                         u["tag"] = DtPart(prevName[k]);
@@ -1386,23 +1853,62 @@ _SET_TAGS_BODY = '''
                         undo.Add(u);
                         modified++;
                     }
+
+                    // v6: as EPLAN does on the next edit of the page - evaluate
+                    // every name on the touched pages NOW, so a point that would
+                    // nest (500S1-500S1:1) shows up in THIS call (and is rolled back).
+                    if (evalPages && ns != null)
+                    {
+                        MethodInfo ev = MethodByShape(ns.GetType(), "EvaluateAndSetAllNames", new string[] { "Page" }, false);
+                        if (ev == null) results["pagesEvaluated"] = "EvaluateAndSetAllNames(Page) not found";
+                        else
+                        {
+                            for (int p = 0; p < touchedPages.Count; p++) Call(ev, ns, new object[] { touchedPages[p] });
+                            results["pagesEvaluated"] = touchedPageNames;
+                            for (int pos2 = 0; pos2 < n; pos2++)
+                            {
+                                int k2 = order[pos2];
+                                Dictionary<string, object> d2 = (Dictionary<string, object>)details[pos2];
+                                string a2 = PropText(tFn[k2], "Name");
+                                if (a2 == null) a2 = "";
+                                if (a2 != (string)d2["name"]) d2["nameAfterEvaluation"] = a2;
+                                d2["visibleDeviceTag"] = VisibleDt(tFn[k2]);
+                                if (!(SameDevice(DtPart(a2), newDt[k2]) && SuffixOk(a2, wantName[k2], newDt[k2])))
+                                {
+                                    k = k2;
+                                    throw new Exception("Item " + tItem[k2] + ": after NameService.EvaluateAndSetAllNames the name is '" +
+                                        a2 + "' for requested '" + wantName[k2] + "' (nested or changed device tag).");
+                                }
+                            }
+                        }
+                    }
                 }
                 catch (Exception exW)
                 {
-                    results["failedAtItem"] = k < n ? tItem[k] : -1;
+                    results["failedAtItem"] = (k >= 0 && k < n) ? tItem[k] : -1;
                     results["modified"] = modified;
                     if (rollback)
                     {
                         List<object> rb = new List<object>();
-                        for (int r = n - 1; r >= 0; r--)
+                        List<int> rbK = new List<int>();
+                        for (int r0 = 0; r0 < n; r0++)
                         {
+                            int r = order[r0];
                             if (!nameTouched[r] && !connTouched[r]) continue;
                             Dictionary<string, object> rd = new Dictionary<string, object>();
                             rd["handle"] = tHandle[r];
                             try
                             {
                                 if (connTouched[r]) SetConnDesignation(tFn[r], connIdx[r], prevConn[r]);
-                                if (nameTouched[r]) SetFunctionName(tFn[r], prevName[r]);
+                                if (nameTouched[r])
+                                {
+                                    SetFunctionName(tFn[r], prevName[r]);
+                                    if (ns != null && nameRoute != "name")
+                                    {
+                                        try { NsCall(ns, "AdjustVisibleName", FnPage(tFn[r]), tFn[r]); }
+                                        catch (Exception exA) { rd["adjustVisibleError"] = Flatten(exA); }
+                                    }
+                                }
                                 rd["name"] = PropText(tFn[r], "Name");
                                 rd["restored"] = string.Equals(PropText(tFn[r], "Name"), prevName[r], StringComparison.Ordinal);
                             }
@@ -1412,41 +1918,121 @@ _SET_TAGS_BODY = '''
                                 rd["error"] = Flatten(exR);
                             }
                             rb.Add(rd);
+                            rbK.Add(r);
+                        }
+                        if (evalPages && ns != null)
+                        {
+                            try
+                            {
+                                MethodInfo ev2 = MethodByShape(ns.GetType(), "EvaluateAndSetAllNames", new string[] { "Page" }, false);
+                                if (ev2 != null)
+                                {
+                                    for (int p = 0; p < touchedPages.Count; p++) Call(ev2, ns, new object[] { touchedPages[p] });
+                                    for (int q = 0; q < rb.Count; q++)
+                                    {
+                                        Dictionary<string, object> rq = (Dictionary<string, object>)rb[q];
+                                        string nq = PropText(tFn[rbK[q]], "Name");
+                                        rq["name"] = nq;
+                                        rq["restored"] = string.Equals(nq, prevName[rbK[q]], StringComparison.Ordinal);
+                                    }
+                                }
+                            }
+                            catch (Exception exE) { results["rollbackEvaluationError"] = Flatten(exE); }
                         }
                         results["rollback"] = rb;
                         results["undo"] = new List<object>();
                     }
+                    List<string> followF = new List<string>();
+                    for (int f = 0; f < n; f++) followF.Add(DtPart(prevName[f]));
+                    int otherF;
+                    results["renamedOthers"] = RenamedOthers(all, nameBefore, tHandle, followF, 200, out otherF);
+                    results["renamedOthersCount"] = otherF;
                     throw new Exception("Renaming stopped: " + Flatten(exW) + (rollback
                         ? " - every change of this call was rolled back (see rollback)."
                         : " - changes before this item stay written (see details / undo)."));
                 }
                 results["modified"] = modified;
+                List<string> follow = new List<string>();
+                for (int f = 0; f < n; f++) follow.Add(DtPart(prevName[f]));
+                int others;
+                results["renamedOthers"] = RenamedOthers(all, nameBefore, tHandle, follow, 200, out others);
+                results["renamedOthersCount"] = others;
             }
             results["success"] = true;
 '''
 
+_TAG_ROUTES = ("auto", "visible", "name")
+
+# Kept in the compact answer (v6, inbox 2026-10-29_eplan_preobsezen_izhod_insert_set_tags.md).
+_TAG_COMPACT_KEYS = ("success", "error", "errorType", "project", "dryRun", "nameRoute",
+                     "functionsScanned", "modified", "merges", "wouldRefuse", "note", "warning",
+                     "warnings", "undo", "rollback", "failedAtItem", "pagesEvaluated",
+                     "renamedOthersCount", "rollbackEvaluationError")
+
+
+def _tag_line(d):
+    if "name" not in d:
+        return "%s: %s -> %s" % (d.get("handle"), d.get("previousName"), d.get("newName"))
+    return "%s: %s -> %s, displayed %r%s%s" % (
+        d.get("handle"), d.get("previousName"), d.get("nameAfterEvaluation") or d.get("name"),
+        d.get("visibleDeviceTag"), " (tag of its box)" if d.get("takesTagFromBox") else "",
+        "" if d.get("verified") else " NOT VERIFIED")
+
+
+def _compact_tags(out):
+    """v6: one line per function instead of planned + details (~12 kB for one macro)."""
+    rows = out.get("details") or out.get("planned") or []
+    compact = {k: out[k] for k in _TAG_COMPACT_KEYS if k in out}
+    compact["functions"] = [_tag_line(d) for d in rows]
+    bad = [d for d in out.get("details") or [] if not d.get("verified")]
+    if bad:
+        compact["unverified"] = bad
+    others = out.get("renamedOthers") or []
+    compact["followersCount"] = sum(1 for r in others if r.get("followsRenamedDevice"))
+    unexpected = [r for r in others if not r.get("followsRenamedDevice")]
+    if unexpected:
+        compact["unexpectedRenames"] = unexpected
+    if not out.get("success") and "planned" in out:
+        compact["planned"] = out["planned"]   # a failure keeps the whole plan
+    compact["detailsOmitted"] = "planned / details / renamedOthers: verbose=true"
+    return compact
+
 
 def live_set_device_tags(items: list, allow_merge: bool = False, dry_run: bool = False,
                          rollback_on_error: bool = True, allow_real_project: bool = False,
-                         timeout_seconds: float = 300.0) -> dict:
+                         timeout_seconds: float = 300.0, name_route: str = "auto",
+                         evaluate_pages: bool = True, verbose: bool = False) -> dict:
     """
     Set the device tag (BMK) of functions - also PLC connection points
     (clrType Terminal), PLC boxes (PLC) and every other Function subclass -
     one or many in ONE call. WRITES - scratch-only unless allow_real_project=True.
 
     v5: e.g. 510K3:9..16 -> 510K4:1..8, or the
-    PLC box of an inserted ET 200SP macro K1 -> 510K3. Written to
-    FunctionBase.Name {get; set;} (API 2.9) - not to FUNC_IDENTDEVICETAG & co.,
-    which are computed (S063113).
+    PLC box of an inserted ET 200SP macro K1 -> 510K3. Not written to
+    FUNC_IDENTDEVICETAG & co., which are computed (S063113).
+
+    v6 - the DISPLAYED tag: v5 set only FunctionBase.Name; EPLAN kept the
+    visible-name format of the macro tag "-K1", so 510S1 was shown as "-S1".
+    name_route "auto" (default) sets the name, then lets EPLAN's NameService
+    (API 2.9, as the property dialog) derive the visible name from it
+    (AdjustVisibleName); if the displayed tag still differs it types the tag as
+    the visible name (VisibleName + AdjustFullName). Each function is verified
+    on the name AND the displayed tag (FUNC_VISIBLEDEVICETAG, "visibleDeviceTag").
+    Boxes are renamed before PLC points; a point inside its box keeps no own
+    displayed tag and TAKES the box's tag ("takesTagFromBox") - so a window
+    macro needs ONE item: the box (by handle); its points follow. With
+    evaluate_pages EPLAN re-evaluates every name on the touched pages in the
+    same call, so a nested tag (500S1-500S1:1) fails here and is rolled back.
 
     Each item:
         selector: "handle" (from live_read_function_properties / live_read_page)
             or "name" (exact name, the device tag without ":x", or only the last
             segment "510K3"), narrowed by "page" and "connection" (the CURRENT
             connection point designation, e.g. "9"). Must match ONE function.
-        "tag": new device tag. Without '=' / '+' only the last segment is
-            replaced and the structure kept ("510K4" on "=AB-C+DI-510K3" ->
-            "=AB-C+DI-510K4"); with '=' or '+' it is the whole tag.
+        "tag": new device tag, e.g. "510S1" or "-510S1" (displayed as given;
+            v6 adds no "-" to a tag that had none). Without '=' / '+' only the
+            last segment is replaced and the structure kept ("510K4" on
+            "=AB-C+DI-510K3" -> "=AB-C+DI-510K4"); with '=' or '+' it is whole.
         "connection_designation": optional new connection point designation
             of that point (FUNC_CONNECTIONDESIGNATION[index]), e.g. "1".
         "scope": "function" (default) or "device" = every function that
@@ -1459,11 +2045,12 @@ def live_set_device_tags(items: list, allow_merge: bool = False, dry_run: bool =
     several matches, two items on one function, unknown connection point ->
     nothing written). A new device tag that OTHER functions already carry
     merges these functions into that device: refused unless allow_merge=True
-    ("merges" lists them). Each write is read back ("name", "verified"). On an
-    error everything this call wrote is rolled back (rollback_on_error) and
-    "rollback" reports it. "undo" holds the items that restore the previous
-    tags - pass it back as items. Not saved: on EPLAN's undo stack until the
-    project is saved.
+    ("merges" lists them; v6 compares without the sign "-", so "-510K3" finds
+    an existing "510K3"). On an error everything this call wrote is rolled back
+    (rollback_on_error) and "rollback" reports it. "undo" holds the items that
+    restore the previous tags - pass it back as items. EPLAN stores the change
+    in the project database itself (there is no save command; see
+    get_current_project "databaseLastWrite").
 
     Args:
         items: list of items (see above), at most 500.
@@ -1473,18 +2060,34 @@ def live_set_device_tags(items: list, allow_merge: bool = False, dry_run: bool =
         rollback_on_error: Default True.
         allow_real_project: Must be True to write outside the scratch root.
         timeout_seconds: Default 300 (the project is walked once per call).
+        name_route: v6. "auto" (default), "visible" (visible name +
+            AdjustFullName only) or "name" (v5: FunctionBase.Name only, the
+            displayed tag is reported but not enforced).
+        evaluate_pages: v6. Default True: NameService.EvaluateAndSetAllNames on
+            every touched page after the writes, then everything re-verified.
+        verbose: v6. False (default): one line per function ("functions"),
+            failures in full ("unverified"), "unexpectedRenames"; True: also
+            "planned", "details", "renamedOthers".
 
     Returns:
-        {"success", "project", "dryRun", "functionsScanned", "planned":
-         [{"item", "handle", "page", "clrType", "previousName", "newName",
-         "connectionIndex", "previousConnection", "newConnection"}], "merges":
-         {tag: {"existingFunctions", "examples"}}, "details": [... + "name",
-         "visibleName", "route", "verified", "verifiedBy"], "modified",
-         "undo": [items], "rollback", "failedAtItem"}
+        {"success", "project", "dryRun", "nameRoute", "functionsScanned",
+         "functions": ["handle: previous -> name, displayed '...'"], "merges":
+         {tag: {"existingFunctions", "examples"}}, "modified", "undo": [items],
+         "pagesEvaluated", "renamedOthersCount", "followersCount" (points that
+         followed their renamed box), "unexpectedRenames" (other functions EPLAN
+         renamed), "unverified", "rollback", "failedAtItem"; verbose adds
+         "planned": [{"item", "handle", "page", "clrType", "previousName",
+         "visibleBefore", "newName", "connectionIndex", "previousConnection",
+         "newConnection"}], "details": [... + "name", "visibleDeviceTag",
+         "visibleName", "route", "verified", "visibleVerified", "verifiedBy",
+         "takesTagFromBox", "nameAfterEvaluation"], "renamedOthers"}
     """
     try:
         its = _tag_items(items)
         timeout_seconds = float(timeout_seconds)
+        route = str(name_route or "auto").strip().lower()
+        if route not in _TAG_ROUTES:
+            raise SchematicValueError("name_route must be 'auto', 'visible' or 'name', got %r." % (name_route,))
     except SchematicValueError as exc:
         return _err(exc)
     except (TypeError, ValueError) as exc:
@@ -1494,6 +2097,7 @@ def live_set_device_tags(items: list, allow_merge: bool = False, dry_run: bool =
         _SET_TAGS_BODY,
         DRYRUN=cs_bool(dry_run), ALLOWMERGE=cs_bool(allow_merge),
         ROLLBACK=cs_bool(rollback_on_error),
+        NAMEROUTE='"%s"' % route, EVALPAGES=cs_bool(evaluate_pages),
         IHANDLE=_cs_str_array([d["handle"] for d in its]),
         INAME=_cs_str_array([d["name"] for d in its]),
         IPAGE=_cs_str_array([d["page"] for d in its]),
@@ -1506,14 +2110,24 @@ def live_set_device_tags(items: list, allow_merge: bool = False, dry_run: bool =
                 extra_helpers=_HELPERS_SCHEMATIC + _HELPERS_PROPS),
         timeout=timeout_seconds,
     ), keep=("details", "project", "planned", "merges", "undo", "rollback",
-             "failedAtItem", "modified", "dryRun"))
+             "failedAtItem", "modified", "dryRun", "nameRoute", "renamedOthers",
+             "renamedOthersCount", "pagesEvaluated", "rollbackEvaluationError"))
     if out.get("success"):
         if dry_run and out.get("wouldRefuse"):
             out["note"] = ("Dry run: the write would be refused - %s already exist(s). "
                            "Pass allow_merge=true if the merge is intended."
                            % ", ".join(sorted(out.get("merges") or {})))
-        shorts = [d.get("handle") for d in out.get("details") or [] if d.get("verifiedBy") == "shortTag"]
-        if shorts:
-            out["warning"] = ("EPLAN stored a different structure than requested for %s - "
-                              "compare 'name' with 'newName'." % ", ".join(shorts))
+        warnings = []
+        unver = [d.get("handle") for d in out.get("details") or [] if not d.get("visibleVerified")]
+        if unver and route == "name":
+            warnings.append("name_route 'name': the displayed device tag differs from the requested "
+                            "one for %s - compare 'visibleDeviceTag'." % ", ".join(unver))
+        unexpected = [r for r in out.get("renamedOthers") or [] if not r.get("followsRenamedDevice")]
+        if unexpected:
+            warnings.append("EPLAN also renamed %d other function(s) - see unexpectedRenames / renamedOthers."
+                            % len(unexpected))
+        if warnings:
+            out["warnings"] = warnings
+    if not verbose and ("planned" in out or "details" in out):
+        out = _compact_tags(out)
     return out

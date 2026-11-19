@@ -72,7 +72,9 @@ Traps that cost real debugging time, all encoded below:
 """
 
 import copy
+import json
 import math
+import os
 import re
 import time
 import uuid
@@ -834,7 +836,8 @@ def live_create_page(plant: str = None, location: str = None, counter: int = 1,
                      page_type: str = "Circuit",
                      allow_real_project: bool = False,
                      timeout_seconds: float = 90.0,
-                     description: str = None) -> dict:
+                     description: str = None,
+                     page_name: str = None) -> dict:
     """
     Create a schematic page in the open project. WRITES - scratch-only by default.
 
@@ -868,14 +871,20 @@ def live_create_page(plant: str = None, location: str = None, counter: int = 1,
         timeout_seconds: Default 90s.
         description: v5. Page description (#11011), plain text or
             "sl_SI@Text;en_US@Text;". Omit for none.
+        page_name: v6. Page name with a non-numeric part, e.g. "200a" or
+            "902a" (#11000 PAGE_COUNTER as text) - replaces counter. Set at
+            Page.Create, else on the new page's live properties; read back
+            ("pageNameRoute"). A page "=<plant>+<location>/<page_name>" that
+            already exists is refused before anything is created.
 
     Returns:
         {"success", "page" (the actual name), "pageType", "gridSize", "size",
          "handle", "undo": {"tool", "page"}, "page_after"; with description
          also "description" (as stored), "descriptionRoute",
-         "descriptionVerified"}. If the page was created but the description
-        could not be set, success is false and "page" / "pageCreated" / "undo"
-        say which page to remove.
+         "descriptionVerified"}; with page_name also "pageNameRoute". If the
+        page was created but the description or page name could not be set,
+        success is false and "page" / "pageCreated" / "undo" say which page to
+        remove.
 
         "gridSize" is the coordinate quantum for later placements - 3.175mm
         (one eighth inch) on the reference installation. Placing off-grid tends
@@ -887,6 +896,13 @@ def live_create_page(plant: str = None, location: str = None, counter: int = 1,
         plant_cs = cs_escape(cs_text(plant, "plant")) if plant else None
         loc_cs = cs_escape(cs_text(location, "location")) if location else None
         descr = cs_text(description, "description") if description is not None else None
+        pname = None
+        if page_name is not None:
+            pname = cs_text(page_name, "page_name").strip()
+            if not re.match(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,19}$", pname):
+                raise SchematicValueError(
+                    "page_name must be 1-20 letters / digits / . _ - starting with a letter or "
+                    "digit (e.g. \"200a\"), got %r." % (page_name,))
     except SchematicValueError as exc:
         return _err(exc)
 
@@ -903,7 +919,8 @@ def live_create_page(plant: str = None, location: str = None, counter: int = 1,
         sets.append('            routes["DESIGNATION_PLANT"] = SetProp(ppl, "DESIGNATION_PLANT", "%s");\n' % plant_cs)
     if loc_cs:
         sets.append('            routes["DESIGNATION_LOCATION"] = SetProp(ppl, "DESIGNATION_LOCATION", "%s");\n' % loc_cs)
-    sets.append('            routes["PAGE_COUNTER"] = SetProp(ppl, "PAGE_COUNTER", (int)%d);\n' % counter)
+    if pname is None:
+        sets.append('            routes["PAGE_COUNTER"] = SetProp(ppl, "PAGE_COUNTER", (int)%d);\n' % counter)
 
     body = _guard_prelude(allow_real_project) + '''
             Type pageType = FindType("Eplan.EplApi.DataModel.Page");
@@ -951,6 +968,17 @@ def live_create_page(plant: str = None, location: str = None, counter: int = 1,
             results["page_after"] = ReadPage(page, 50, false, null);
 '''
     body = _fill(body, PAGETYPE='"%s"' % cs_escape(page_type))
+    if pname is not None:
+        # v6 (inbox 2026-10-29_eplan_create_page_ime_strani_z_crko.md). Spliced
+        # after _fill, so the caller's text is never re-scanned for tokens.
+        pn = '"%s"' % cs_escape(pname)
+        expected = ("=" + plant if plant else "") + ("+" + location if location else "") + "/" + pname
+        body = body.replace(_PROPERTY_ROUTES_LINE, _PAGE_NAME_AT_CREATE.replace("PNWANT", pn)
+                            + _PROPERTY_ROUTES_LINE, 1)
+        body = body.replace(_CREATE_PAGE_LINE, _PAGE_NAME_EXISTS.replace(
+            "PNEXPECTED", '"%s"' % cs_escape(expected)) + _CREATE_PAGE_LINE, 1)
+        body = body.replace(_PAGE_AFTER_LINE, _PAGE_NAME_BLOCK.replace("PNWANT", pn)
+                            + _PAGE_AFTER_LINE, 1)
     if descr is not None:
         # Filled on its own and spliced in afterwards, so the description text
         # is never re-scanned for template tokens (see _fill).
@@ -987,6 +1015,51 @@ def live_create_page(plant: str = None, location: str = None, counter: int = 1,
 
 # v5: the line before which the description block is spliced.
 _PAGE_AFTER_LINE = '            results["page_after"] = ReadPage(page, 50, false, null);\n'
+
+# v6: page_name - lines the page-name blocks are spliced before.
+_PROPERTY_ROUTES_LINE = '            results["propertyRoutes"] = routes;\n'
+_CREATE_PAGE_LINE = '            object page = Activator.CreateInstance(pageType);\n'
+
+# PAGE_COUNTER (#11000) as TEXT at Page.Create; a refusal is recorded, the
+# name is then set on the live page (_PAGE_NAME_BLOCK).
+_PAGE_NAME_AT_CREATE = '''            try { routes["PAGE_COUNTER"] = SetProp(ppl, "PAGE_COUNTER", PNWANT); }
+            catch (Exception exPn) { routes["PAGE_COUNTER"] = "not at Page.Create: " + Flatten(exPn); }
+'''
+
+# Refuse an existing page of that name BEFORE anything is created.
+_PAGE_NAME_EXISTS = '''            {
+                Type dfType = FindType("Eplan.EplApi.DataModel.DMObjectsFinder");
+                object dFinder = Activator.CreateInstance(dfType, new object[] { project });
+                Type pfType = FindType("Eplan.EplApi.DataModel.PagesFilter");
+                object pFilter = Activator.CreateInstance(pfType);
+                MethodInfo gp = RequireMethod(dfType, "GetPages", new string[] { pfType.Name }, false);
+                foreach (object ep in (IEnumerable)Call(gp, dFinder, new object[] { pFilter }))
+                {
+                    if (ep == null) continue;
+                    string en = PropText(ep, "Name");
+                    if (en != null && string.Equals(en, PNEXPECTED, StringComparison.OrdinalIgnoreCase))
+                        throw new Exception("Page '" + en + "' already exists - nothing created.");
+                }
+            }
+'''
+
+# Read the name back; if Page.Create ignored the text, set it on the page.
+_PAGE_NAME_BLOCK = '''            {
+                string wantPn = PNWANT;
+                string gotPn = PropText(page, "Name");
+                if (gotPn == null || !gotPn.EndsWith("/" + wantPn, StringComparison.OrdinalIgnoreCase))
+                {
+                    object pnProps = RequireReadable(page.GetType(), "Properties").GetValue(page, null);
+                    results["pageNameRoute"] = "Page.Properties.PAGE_COUNTER " + SetLiveProp(pnProps, "PAGE_COUNTER", wantPn);
+                    gotPn = PropText(page, "Name");
+                }
+                else results["pageNameRoute"] = "PagePropertyList.PAGE_COUNTER (text) at Page.Create";
+                results["page"] = gotPn;
+                if (gotPn == null || !gotPn.EndsWith("/" + wantPn, StringComparison.OrdinalIgnoreCase))
+                    throw new Exception("Page created as '" + gotPn + "', not with the page name '" + wantPn +
+                        "' - remove it (undo).");
+            }
+'''
 
 # v5: page description = PagePropertyList.PAGE_NOMINATIOMN (#11011, "Page
 # description" in API 2.9). Set through the LIVE page property list after
@@ -1540,10 +1613,41 @@ def live_read_page(page: str, include_pins: bool = True, limit: int = 200,
 # 6. Remove
 # ---------------------------------------------------------------------------
 
+def _page_before_summary(out):
+    """v6 (inbox 2026-10-29_eplan_remove_page_preobsezen_izhod.md): page_before -> file + summary."""
+    pb = out.pop("page_before", None)
+    if not isinstance(pb, dict):
+        return out
+    counts, names = {}, []
+    for pl in pb.get("placements") or []:
+        t = pl.get("clrType") or "?"
+        counts[t] = counts.get(t, 0) + 1
+        n = pl.get("name")
+        if n and n not in names:
+            names.append(n)
+    out["pageBefore"] = {"placementCount": pb.get("placementCount"), "returned": pb.get("returned"),
+                         "truncated": pb.get("truncated"), "countsByType": counts,
+                         "functionNames": sorted(names)}
+    try:
+        from .scripted import _WORK_ROOT
+        folder = os.path.join(_WORK_ROOT, "page_before")
+        os.makedirs(folder, exist_ok=True)
+        base = re.sub(r"[^A-Za-z0-9._-]+", "_", str(out.get("page") or "page")).strip("_") or "page"
+        path = os.path.join(folder, "%s_%s.json" % (base, time.strftime("%Y%m%d_%H%M%S")))
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(pb, f, ensure_ascii=False, indent=1)
+        out["pageBeforeFile"] = path
+    except (OSError, TypeError, ValueError) as exc:
+        out["pageBeforeFileError"] = str(exc)
+        out["page_before"] = pb
+    return out
+
+
 def live_remove_placement(page: str, handle: str = None,
                           expect_type: str = None, remove_page: bool = False,
                           allow_real_project: bool = False,
-                          timeout_seconds: float = 90.0) -> dict:
+                          timeout_seconds: float = 90.0,
+                          verbose: bool = False) -> dict:
     """
     Remove one placement, or a whole page. WRITES - scratch-only by default.
 
@@ -1567,11 +1671,16 @@ def live_remove_placement(page: str, handle: str = None,
             handle to be omitted, so it cannot happen by accident.
         allow_real_project: Must be True to write outside the scratch root.
         timeout_seconds: Default 90s.
+        verbose: v6, remove_page only. False (default): "page_before" is
+            written to a JSON file on the EPLAN machine ("pageBeforeFile") and
+            the answer carries "pageBefore": {"placementCount", "countsByType",
+            "functionNames", ...}; True returns "page_before" in full (~60 kB
+            for one macro page).
 
     Returns:
-        {"success", "page", "removed", "removedType", "page_before",
-         "page_after"} - or, for remove_page, {"pageRemoved": true} with
-        "page_before" as the record of what was destroyed.
+        {"success", "page", "removed", "removedType", "page_after"} - or, for
+        remove_page, {"pageRemoved": true, "pageBefore", "pageBeforeFile"}
+        ("page_before" with verbose=True) as the record of what was destroyed.
     """
     try:
         page_cs = cs_escape(cs_text(page, "page"))
@@ -1621,10 +1730,13 @@ def live_remove_placement(page: str, handle: str = None,
         body = _fill(body, HANDLE='"%s"' % handle_cs)
     body = _fill(body, PAGENAME='"%s"' % page_cs)
 
-    return _shape(_execute_script(
+    out = _shape(_execute_script(
         _script(_cls("Remove"), body, extra_helpers=_HELPERS_SCHEMATIC),
         timeout=timeout_seconds,
     ))
+    if remove_page and not verbose and out.get("success"):
+        out = _page_before_summary(out)
+    return out
 
 
 # ---------------------------------------------------------------------------
