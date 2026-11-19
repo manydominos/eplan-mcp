@@ -52,9 +52,10 @@ def test_log_dir_honours_the_env_override(manager, tmp_path, monkeypatch):
 
 
 def test_log_dir_falls_back_to_the_package_default(manager, monkeypatch):
+    # v2: default is %TEMP%\eplan_mcp\logs, not the code folder
+    import tempfile
     monkeypatch.delenv("EPLAN_MCP_LOG_DIR", raising=False)
-    assert manager._log_dir().endswith("logs")
-    assert "mcp_server" in manager._log_dir()
+    assert manager._log_dir() == os.path.join(tempfile.gettempdir(), "eplan_mcp", "logs")
 
 
 def test_log_dir_is_read_per_call_not_cached(manager, tmp_path, monkeypatch):

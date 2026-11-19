@@ -20,6 +20,7 @@ import os
 import sys
 import types
 import functools
+import tempfile
 from mcp.server.fastmcp import FastMCP
 from eplan_connection import get_manager, detect_installed_versions
 
@@ -230,7 +231,7 @@ def eplan_test(show_dialog: bool = False) -> str:
 
     if show_dialog:
         # Create test script
-        scripts_dir = os.path.join(SCRIPT_DIR, "scripts")
+        scripts_dir = os.path.join(tempfile.gettempdir(), "eplan_mcp", "scripts")
         os.makedirs(scripts_dir, exist_ok=True)
         script_path = os.path.join(scripts_dir, "mcp_test.cs")
 

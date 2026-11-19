@@ -14,6 +14,7 @@ import re
 import json
 import time
 import uuid
+import tempfile
 from typing import Optional, List
 from cs_json import prepare_script
 
@@ -56,6 +57,10 @@ def cs_escape(value) -> str:
 # Root folder of EPLAN installations. Override with the EPLAN_PLATFORM_ROOT
 # environment variable for non-standard install locations.
 PLATFORM_ROOT = os.environ.get("EPLAN_PLATFORM_ROOT", r"C:\Program Files\EPLAN\Platform")
+
+# v2 (zagon z Z:): generated scripts, results and logs go to the local TEMP,
+# never into the code folder (which may be a shared/network folder).
+WORK_ROOT = os.path.join(tempfile.gettempdir(), "eplan_mcp")
 
 
 def _version_key(name: str):
@@ -669,7 +674,7 @@ class EPLANConnectionManager:
         override = os.environ.get("EPLAN_MCP_LOG_DIR")
         if override:
             return override
-        return os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs")
+        return os.path.join(WORK_ROOT, "logs")
 
     def _log_action(self, action: str, result: dict, started: float) -> None:
         """Append one JSON line per executed action to actions.jsonl.
@@ -746,7 +751,7 @@ class EPLANConnectionManager:
                 params[key] = val
 
             # Generate directories
-            base_dir = os.path.dirname(os.path.abspath(__file__))
+            base_dir = WORK_ROOT
             script_dir = os.path.join(base_dir, "scripts", "generated")
             results_dir = os.path.join(base_dir, "scripts", "results")
             os.makedirs(script_dir, exist_ok=True)
