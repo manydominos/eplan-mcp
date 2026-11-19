@@ -42,6 +42,13 @@ answers by default (verbose=True for everything); live_insert_window_macro
 reports every renamed existing function and box overlap; replace_article
 (auto) refuses a part number that is not in the parts database.
 
+v8 (inbox 2026-10-30_eplan_ni_orodja_prikaz_lastnosti_na_skatli.md):
+live_place_function_property shows a function property on the sheet
+(PropertyPlacement) - makes a hidden one visible or creates one, for many
+symbols in one call. v8 (inbox 2026-10-30_eplan_ni_orodja_dodaj_artikel_
+funkciji_brez_artikla.md): live_add_function_articles appends article
+references (module + BaseUnit) to functions, with the parts database guard.
+
 API names used on EPLAN 2.9 (eplan.help API 2.9):
     FunctionPropertyList.FUNC_PLCADDRESS                     #20400
     FunctionPropertyList.FUNC_PLCCHANNEL_DESIGNATION_MANUAL  #20407
@@ -68,6 +75,8 @@ __all__ = [
     "live_set_function_properties",
     "live_insert_window_macro",
     "live_set_device_tags",
+    "live_place_function_property",
+    "live_add_function_articles",
 ]
 
 
@@ -2130,4 +2139,1155 @@ def live_set_device_tags(items: list, allow_merge: bool = False, dry_run: bool =
             out["warnings"] = warnings
     if not verbose and ("planned" in out or "details" in out):
         out = _compact_tags(out)
+    return out
+
+
+# ---------------------------------------------------------------------------
+# v8  show a property of a function on the sheet (property placement)
+# ---------------------------------------------------------------------------
+# inbox 2026-10-30_eplan_ni_orodja_prikaz_lastnosti_na_skatli.md (
+# FUNC_PLCTYPE_ID of 26 Siemens PLC boxes is filled in but not shown).
+#
+# API 2.9 (eplan.help, Eplan.EplApi.DataModel):
+#   SymbolReference.PropertyPlacements          PropertyPlacement[] {get;}
+#   SymbolReference.UseLocalPropertyPlacements  bool {get; set;}
+#   SymbolReference.SwitchLocalPropertyPlacements(bool)
+#   Graphics.PropertyPlacement()  +  .Create(SymbolReference, AnyPropertyId)
+#                                    .Create(SymbolReference, AnyPropertyId, RelationType, int)
+#   PropertyPlacement.DisplayedProperty (AnyPropertyId), IsSetAsVisible
+#   (Placement.Visibility), IsVisible, Location, Height, Justification
+#   (TextBase.JustificationType), GetDisplayString()
+#   PropertyValue.Id (AnyPropertyId), AnyPropertyId.AsInt / Index
+# Class example (PropertyPlacement, API 2.9):
+#   oFunction.SwitchLocalPropertyPlacements(true);
+#   PropertyPlacement p = new PropertyPlacement(); p.Create(oFunction, 20011);
+#   p.IsVisible = true; p.Height = 15; p.Location = new PointD(10.0, 25.0);
+
+_HELPERS_PP = r'''
+    // ---- v8: live_place_function_property --------------------------------
+    // The symbol outline: GetLogicalArea() (RectangleD LowerLeft/UpperRight;
+    // API 2.9 throws NotImplementedException where there is none), else
+    // GetBoundingBox(). mode: "auto" / "logical_area" / "bounding_box".
+    static double[] SymbolBox(object sr, string mode, out string source, Dictionary<string, object> info)
+    {
+        source = null;
+        double[] la = null;
+        MethodInfo gl = MethodByShape(sr.GetType(), "GetLogicalArea", new string[] { }, false);
+        if (gl != null)
+        {
+            try
+            {
+                object r = gl.Invoke(sr, null);
+                object ll = r == null ? null : TryRead(r, "LowerLeft", null);
+                object ur = r == null ? null : TryRead(r, "UpperRight", null);
+                if (ll != null && ur != null)
+                {
+                    double[] b = BBoxAdd(BBoxAdd(null, ll), ur);
+                    if (b[2] - b[0] > 0.001 && b[3] - b[1] > 0.001) la = b;
+                }
+            }
+            catch (TargetInvocationException tie) { info["logicalAreaError"] = Flatten(tie.InnerException); }
+            catch (Exception ex) { info["logicalAreaError"] = Flatten(ex); }
+        }
+        double[] bb = BBoxOf(sr);
+        if (la != null) info["logicalArea"] = MinMax(la);
+        if (bb != null) info["boundingBox"] = MinMax(bb);
+        if (mode != "bounding_box" && la != null) { source = "logicalArea"; return la; }
+        if (mode == "logical_area") return null;
+        if (bb != null) source = "boundingBox";
+        return bb;
+    }
+
+    static object PpFind(object sr, int want, int wantIdx, string rel, bool shownOnly)
+    {
+        object arr = TryRead(sr, "PropertyPlacements", null);
+        if (!(arr is IEnumerable)) return null;
+        object hidden = null;
+        foreach (object pp in (IEnumerable)arr)
+        {
+            if (pp == null) continue;
+            if (PpPropId(pp) != want) continue;
+            int ix = PpPropIdx(pp);
+            if (wantIdx > 0 && ix > 0 && ix != wantIdx) continue;
+            if (rel.Length > 0 && SafeText(TryRead(pp, "Relation", null)) != rel) continue;
+            if (PpShown(pp)) return pp;
+            if (hidden == null) hidden = pp;
+        }
+        return shownOnly ? null : hidden;
+    }
+
+    static int PpCount(object sr, int want)
+    {
+        object arr = TryRead(sr, "PropertyPlacements", null);
+        int n = 0;
+        if (arr is IEnumerable) foreach (object pp in (IEnumerable)arr) if (pp != null && PpPropId(pp) == want) n++;
+        return n;
+    }
+
+    // Height of the symbol's other SHOWN property texts ("like the other texts of the macro").
+    static double PpTemplateHeight(object sr, int notId, out string from)
+    {
+        from = null;
+        object arr = TryRead(sr, "PropertyPlacements", null);
+        if (!(arr is IEnumerable)) return 0;
+        foreach (object pp in (IEnumerable)arr)
+        {
+            if (pp == null || PpPropId(pp) == notId || !PpShown(pp)) continue;
+            object h = TryRead(pp, "Height", null);
+            double v = 0;
+            try { v = h == null ? 0 : Convert.ToDouble(h); } catch { v = 0; }
+            if (v > 0) { from = Handle(pp) + " (property " + PpPropId(pp) + ")"; return v; }
+        }
+        return 0;
+    }
+
+    static string PpMakeVisible(object pp)
+    {
+        List<string> routes = new List<string>();
+        PropertyInfo iv = GetWritable(pp.GetType(), "IsVisible");
+        if (iv != null)
+        {
+            try { iv.SetValue(pp, true, null); routes.Add("IsVisible=true"); }
+            catch (TargetInvocationException tie) { routes.Add("IsVisible threw " + Flatten(tie.InnerException)); }
+            catch (Exception ex) { routes.Add("IsVisible threw " + Flatten(ex)); }
+        }
+        PropertyInfo sv = GetWritable(pp.GetType(), "IsSetAsVisible");
+        if (sv != null && sv.PropertyType.IsEnum)
+        {
+            try { sv.SetValue(pp, Enum.Parse(sv.PropertyType, "Visible"), null); routes.Add("IsSetAsVisible=Visible"); }
+            catch (TargetInvocationException tie) { routes.Add("IsSetAsVisible threw " + Flatten(tie.InnerException)); }
+            catch (Exception ex) { routes.Add("IsSetAsVisible threw " + Flatten(ex)); }
+        }
+        if (iv == null && sv == null)
+            throw new Exception("PropertyPlacement has neither a writable IsVisible nor IsSetAsVisible. " +
+                MemberList(pp.GetType(), false));
+        if (!PpShown(pp))
+            throw new Exception("Property placement " + Handle(pp) + " is still not visible after the write (" +
+                string.Join("; ", routes.ToArray()) + "; IsSetAsVisible=" + PpVisibility(pp) + ").");
+        return string.Join("; ", routes.ToArray());
+    }
+
+    static void PpSetLocation(object pp, double x, double y)
+    {
+        PropertyInfo pi = RequireWritable(pp.GetType(), "Location");
+        try { pi.SetValue(pp, MakePoint(pi.PropertyType, x, y), null); }
+        catch (TargetInvocationException tie) { throw new Exception("Location: " + Flatten(tie.InnerException)); }
+    }
+
+    static void PpSetJustification(object pp, string name)
+    {
+        PropertyInfo pi = RequireWritable(pp.GetType(), "Justification");
+        object v;
+        try { v = Enum.Parse(pi.PropertyType, name, true); }
+        catch
+        {
+            throw new Exception("justification '" + name + "' is not a " + pi.PropertyType.FullName +
+                " value. Values: " + string.Join(", ", Enum.GetNames(pi.PropertyType)));
+        }
+        try { pi.SetValue(pp, v, null); }
+        catch (TargetInvocationException tie) { throw new Exception("Justification: " + Flatten(tie.InnerException)); }
+    }
+
+    static void PpSetHeight(object pp, double h)
+    {
+        PropertyInfo pi = RequireWritable(pp.GetType(), "Height");
+        try { pi.SetValue(pp, h, null); }
+        catch (TargetInvocationException tie) { throw new Exception("Height: " + Flatten(tie.InnerException)); }
+    }
+
+    static void PpRestore(object o, string prop, object value)
+    {
+        if (o == null || value == null) return;
+        PropertyInfo pi = GetWritable(o.GetType(), prop);
+        if (pi != null) pi.SetValue(o, value, null);
+    }
+
+    static MethodInfo PpCreateMethod(bool withRelation)
+    {
+        Type ppType = FindType("Eplan.EplApi.DataModel.Graphics.PropertyPlacement");
+        return withRelation
+            ? RequireMethod(ppType, "Create", new string[] { "SymbolReference", "AnyPropertyId", "RelationType", "Int32" }, false)
+            : RequireMethod(ppType, "Create", new string[] { "SymbolReference", "AnyPropertyId" }, false);
+    }
+
+    static object PpCreate(object sr, object anyId, string rel, int relIdx)
+    {
+        Type ppType = FindType("Eplan.EplApi.DataModel.Graphics.PropertyPlacement");
+        object pp = Activator.CreateInstance(ppType);
+        if (rel.Length == 0)
+        {
+            Call(PpCreateMethod(false), pp, new object[] { sr, anyId });
+            return pp;
+        }
+        MethodInfo cr = PpCreateMethod(true);
+        Type rt = cr.GetParameters()[2].ParameterType;
+        object rv;
+        try { rv = Enum.Parse(rt, rel, true); }
+        catch
+        {
+            throw new Exception("relation '" + rel + "' is not a " + rt.FullName + " value. Values: " +
+                string.Join(", ", Enum.GetNames(rt)));
+        }
+        Call(cr, pp, new object[] { sr, anyId, rv, relIdx });
+        return pp;
+    }
+
+    static bool ReadBool(object o, string name, bool dflt)
+    {
+        object v = TryRead(o, name, null);
+        if (v == null) return dflt;
+        try { return Convert.ToBoolean(v); } catch { return dflt; }
+    }
+
+    static Dictionary<string, object> XY(double x, double y)
+    {
+        Dictionary<string, object> d = new Dictionary<string, object>();
+        d["x"] = Math.Round(x, 4);
+        d["y"] = Math.Round(y, 4);
+        return d;
+    }
+'''
+
+
+_PLACE_PP_BODY = '''
+            string[] v8handles = V8HANDLES;
+            string v8page = V8PAGE;
+            string v8pname = V8PNAME;
+            int v8pidx = V8PIDX;
+            int v8pnum = V8PNUM;
+            string v8pos = V8POS;
+            double v8dx = V8DX;
+            double v8dy = V8DY;
+            double v8x = V8X;
+            double v8y = V8Y;
+            double v8height = V8HEIGHT;
+            string v8just = V8JUST;
+            bool v8repos = V8REPOS;
+            string v8rel = V8REL;
+            int v8relIdx = V8RELIDX;
+            bool v8local = V8LOCAL;
+            bool v8dry = V8DRY;
+            bool v8rollback = V8ROLLBACK;
+            string v8boxsrc = V8BOXSRC;
+
+            // ---- 1. resolve every handle BEFORE anything is written ----------
+            List<string> wanted = new List<string>(v8handles);
+            Dictionary<string, object> byH = new Dictionary<string, object>();
+            if (v8page.Length > 0)
+            {
+                object pg = FindPage(project, v8page);
+                foreach (object pl in PagePlacements(pg))
+                {
+                    if (pl == null) continue;
+                    string h0 = Handle(pl);
+                    if (h0 != null && wanted.Contains(h0) && !byH.ContainsKey(h0)) byH[h0] = pl;
+                }
+            }
+            else
+            {
+                foreach (object fn in AllFunctions(project))
+                {
+                    if (fn == null) continue;
+                    string h0 = Handle(fn);
+                    if (h0 != null && wanted.Contains(h0) && !byH.ContainsKey(h0)) byH[h0] = fn;
+                    if (byH.Count == wanted.Count) break;
+                }
+            }
+            List<string> missing = new List<string>();
+            foreach (string h in wanted) if (!byH.ContainsKey(h)) missing.Add(h);
+            if (missing.Count > 0)
+                throw new Exception("Nothing changed: " + missing.Count + " handle(s) not found" +
+                    (v8page.Length > 0 ? " on page '" + v8page + "'" : " among the project's functions") + ": " +
+                    string.Join(", ", missing.ToArray()) + ". Handles are session-scoped - re-read them " +
+                    "(live_read_function_properties / live_read_page).");
+            foreach (string h in wanted)
+                if (!(TryRead(byH[h], "PropertyPlacements", null) is IEnumerable))
+                    throw new Exception("Nothing changed: " + h + " is a " + byH[h].GetType().Name +
+                        " - only symbols (SymbolReference: functions, PLC boxes, terminals ...) carry property placements.");
+
+            // ---- 2. the property id ----------------------------------------
+            Type anyIdType = FindType("Eplan.EplApi.DataModel.AnyPropertyId");
+            object numId = null;
+            if (v8pnum >= 0)
+            {
+                // AnyPropertyId op_Implicit(int) - the API 2.9 class example passes 20011.
+                numId = MakeValue(anyIdType, v8pnum);
+                if (v8pidx > 0)
+                {
+                    PropertyInfo ip = GetWritable(anyIdType, "Index");
+                    if (ip == null) throw new Exception("AnyPropertyId has no writable Index. " + MemberList(anyIdType, false));
+                    ip.SetValue(numId, v8pidx, null);
+                }
+            }
+            results["createApi"] = PpCreateMethod(v8rel.Length > 0).ToString();
+
+            // ---- 3. plan: per symbol, what will happen ----------------------
+            List<object> items = new List<object>();
+            List<object[]> plan = new List<object[]>();
+            int wantId = -1;
+            foreach (string h in wanted)
+            {
+                object fn = byH[h];
+                Dictionary<string, object> it = new Dictionary<string, object>();
+                it["handle"] = h;
+                it["clrType"] = fn.GetType().Name;
+                string nm = SafeText(TryRead(fn, "Name", null));
+                if (nm != null && nm.Length > 0) it["name"] = nm;
+                object anyId = numId;
+                if (v8pnum < 0)
+                {
+                    object props = FnProps(fn);
+                    PropertyInfo pi = FnPropInfo(props, v8pname, v8pidx);
+                    if (pi == null)
+                        throw new Exception("Nothing changed: " + props.GetType().Name + " of " + h + " declares no '" + v8pname +
+                            (v8pidx > 0 ? "[int]" : "") + "'. Similar names: " +
+                            string.Join(", ", PropNamesContaining(props.GetType(), v8pname.Length > 8 ? v8pname.Substring(5, 3) : v8pname, 60).ToArray()) +
+                            ". A number (property id) is accepted too.");
+                    object pv;
+                    try { pv = v8pidx > 0 ? pi.GetValue(props, new object[] { v8pidx }) : pi.GetValue(props, null); }
+                    catch (TargetInvocationException tie) { throw new Exception("Nothing changed: reading " + v8pname + " of " + h + ": " + Flatten(tie.InnerException)); }
+                    anyId = pv == null ? null : TryRead(pv, "Id", null);
+                    if (anyId == null)
+                        throw new Exception("Nothing changed: " + v8pname + " of " + h + " gives no PropertyValue.Id (AnyPropertyId).");
+                    it["propertyValue"] = PvText(pv);
+                }
+                int idNow = PpInt(anyId, "AsInt", -1);
+                if (idNow < 0) throw new Exception("Nothing changed: AnyPropertyId.AsInt not readable. " + MemberList(anyId.GetType(), false));
+                if (wantId < 0) wantId = idNow;
+                it["propertyId"] = idNow;
+                it["useLocalPropertyPlacements"] = ReadBool(fn, "UseLocalPropertyPlacements", true);
+                object found = PpFind(fn, idNow, v8pidx, v8rel, false);
+                it["existing"] = PpCount(fn, idNow);
+                string action = found == null ? "create" : (PpShown(found) ? "alreadyVisible" : "makeVisible");
+                it["action"] = action;
+                if (found != null) it["before"] = DumpPropPl(found);
+
+                // target point
+                bool place = v8pos != "keep";
+                double px = 0, py = 0;
+                string jdef = "";
+                if (v8pos == "absolute") { px = v8x + v8dx; py = v8y + v8dy; }
+                else if (place)
+                {
+                    string bsrc;
+                    double[] box = SymbolBox(fn, v8boxsrc, out bsrc, it);
+                    if (box == null)
+                        throw new Exception("Nothing changed: no outline for " + h + " (box_source=" + v8boxsrc +
+                            ") - use position='absolute' with x, y.");
+                    it["boxSource"] = bsrc;
+                    if (v8pos == "above_top_left") { px = box[0] + v8dx; py = box[3] + v8dy; jdef = "BottomLeft"; }
+                    else if (v8pos == "above_top_right") { px = box[2] + v8dx; py = box[3] + v8dy; jdef = "BottomRight"; }
+                    else if (v8pos == "below_bottom_left") { px = box[0] + v8dx; py = box[1] + v8dy; jdef = "TopLeft"; }
+                    else if (v8pos == "below_bottom_right") { px = box[2] + v8dx; py = box[1] + v8dy; jdef = "TopRight"; }
+                    else { px = box[0] + v8dx; py = box[3] + v8dy; jdef = "TopLeft"; }   // inside_top_left
+                }
+                string just = v8just.Length > 0 ? v8just : jdef;
+                bool move = place && (action == "create" || v8repos);
+                if (move) it["targetPoint"] = XY(px, py);
+                if (move && just.Length > 0) it["justification"] = just;
+                string hfrom;
+                double th = PpTemplateHeight(fn, idNow, out hfrom);
+                double hgt = v8height > 0 ? v8height : (action == "create" ? th : 0);
+                if (hgt > 0)
+                {
+                    it["height"] = Math.Round(hgt, 4);
+                    it["heightSource"] = v8height > 0 ? "explicit" : "like " + hfrom;
+                }
+                else if (action == "create") it["heightSource"] = "EPLAN default (no other visible property text on this symbol)";
+                items.Add(it);
+                plan.Add(new object[] { h, fn, anyId, move, px, py, just, hgt, it });
+            }
+            if (wantId >= 0) results["propertyId"] = wantId;
+            results["items"] = items;
+            results["dryRun"] = v8dry;
+
+            // ---- 4. write (one LockingStep, all or nothing with rollback) ---
+            if (!v8dry)
+            {
+                List<object[]> undo = new List<object[]>();   // {kind, object, property, old value}
+                Dictionary<string, object> failedAt = null;
+                foreach (object[] p in plan)
+                {
+                    string h = (string)p[0];
+                    object fn = p[1];
+                    object anyId = p[2];
+                    bool move = (bool)p[3];
+                    double px = (double)p[4], py = (double)p[5];
+                    string just = (string)p[6];
+                    double hgt = (double)p[7];
+                    Dictionary<string, object> it = (Dictionary<string, object>)p[8];
+                    string step = "start";
+                    try
+                    {
+                        string action = (string)it["action"];
+                        bool needWrite = action != "alreadyVisible" || move || hgt > 0;
+                        if (!needWrite) { it["result"] = "alreadyVisible"; continue; }
+                        // Placements of the symbol VARIANT cannot be changed (read-only symbol
+                        // library) - local copies first, as in the API 2.9 class example.
+                        if (!ReadBool(fn, "UseLocalPropertyPlacements", true))
+                        {
+                            if (!v8local)
+                                throw new Exception("the symbol uses its variant's property placements and make_local=false");
+                            step = "SwitchLocalPropertyPlacements(true)";
+                            Call(RequireMethod(fn.GetType(), "SwitchLocalPropertyPlacements", new string[] { "Boolean" }, false), fn, new object[] { true });
+                            undo.Add(new object[] { "local", fn, null, null });
+                            it["switchedToLocal"] = true;
+                        }
+                        step = "find";
+                        object pp = PpFind(fn, PpInt(anyId, "AsInt", -1), v8pidx, v8rel, false);
+                        string result;
+                        if (pp == null)
+                        {
+                            step = "PropertyPlacement.Create";
+                            pp = PpCreate(fn, anyId, v8rel, v8relIdx);
+                            undo.Add(new object[] { "created", pp, null, null });
+                            step = "make visible";
+                            it["visibleRoute"] = PpMakeVisible(pp);
+                            result = "created";
+                        }
+                        else if (!PpShown(pp))
+                        {
+                            step = "make visible";
+                            undo.Add(new object[] { "set", pp, "IsSetAsVisible", TryRead(pp, "IsSetAsVisible", null) });
+                            undo.Add(new object[] { "set", pp, "IsVisible", TryRead(pp, "IsVisible", null) });
+                            it["visibleRoute"] = PpMakeVisible(pp);
+                            result = "madeVisible";
+                        }
+                        else result = "alreadyVisible";
+                        if (hgt > 0)
+                        {
+                            step = "Height";
+                            if (result != "created") undo.Add(new object[] { "set", pp, "Height", TryRead(pp, "Height", null) });
+                            PpSetHeight(pp, hgt);
+                        }
+                        if (move)
+                        {
+                            if (just.Length > 0)
+                            {
+                                step = "Justification";
+                                if (result != "created") undo.Add(new object[] { "set", pp, "Justification", TryRead(pp, "Justification", null) });
+                                PpSetJustification(pp, just);
+                            }
+                            step = "Location";
+                            if (result != "created") undo.Add(new object[] { "set", pp, "Location", TryRead(pp, "Location", null) });
+                            PpSetLocation(pp, px, py);
+                            if (result != "created") result += "+moved";
+                        }
+                        it["result"] = result;
+                        Dictionary<string, object> after = DumpPropPl(pp);
+                        it["after"] = after;
+                        if (move)
+                        {
+                            // Read back: the stored Location, and whether the drawn text sits at the
+                            // requested point (a Location in another frame would show up here).
+                            object loc = TryRead(pp, "Location", null);
+                            double[] bb = BBoxOf(pp);
+                            if (loc != null)
+                            {
+                                Dictionary<string, object> l = PtDict(loc);
+                                double ddx = Convert.ToDouble(l["x"]) - px, ddy = Convert.ToDouble(l["y"]) - py;
+                                it["locationDelta"] = Math.Round(Math.Sqrt(ddx * ddx + ddy * ddy), 4);
+                            }
+                            if (bb != null)
+                            {
+                                double tol = Math.Max(5.0, 3 * (hgt > 0 ? hgt : 2.5));
+                                it["textNearTarget"] = px >= bb[0] - tol && px <= bb[2] + tol && py >= bb[1] - tol && py <= bb[3] + tol;
+                            }
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        failedAt = new Dictionary<string, object>();
+                        failedAt["handle"] = h;
+                        failedAt["step"] = step;
+                        failedAt["error"] = Flatten(ex);
+                        break;
+                    }
+                }
+                if (failedAt != null)
+                {
+                    results["failedAt"] = failedAt;
+                    if (v8rollback)
+                    {
+                        List<string> rbErr = new List<string>();
+                        int rb = 0;
+                        for (int k = undo.Count - 1; k >= 0; k--)
+                        {
+                            object[] u = undo[k];
+                            try
+                            {
+                                string kind = (string)u[0];
+                                if (kind == "created")
+                                {
+                                    if (IsValidObj(u[1])) Call(RequireMethod(u[1].GetType(), "Remove", new string[] { }, false), u[1], null);
+                                }
+                                else if (kind == "local")
+                                    Call(RequireMethod(u[1].GetType(), "SwitchLocalPropertyPlacements", new string[] { "Boolean" }, false), u[1], new object[] { false });
+                                else if (IsValidObj(u[1])) PpRestore(u[1], (string)u[2], u[3]);
+                                rb++;
+                            }
+                            catch (Exception exr) { rbErr.Add(Flatten(exr)); }
+                        }
+                        results["rolledBack"] = rb;
+                        if (rbErr.Count > 0) results["rollbackErrors"] = rbErr;
+                    }
+                }
+            }
+'''
+
+
+_PP_POSITIONS = {
+    # position: (default dx, default dy, default justification)
+    "above_top_left": (0.0, 1.0, "BottomLeft"),
+    "above_top_right": (0.0, 1.0, "BottomRight"),
+    "below_bottom_left": (0.0, -1.0, "TopLeft"),
+    "below_bottom_right": (0.0, -1.0, "TopRight"),
+    "inside_top_left": (1.0, -1.0, "TopLeft"),
+    "absolute": (0.0, 0.0, ""),
+    "keep": (0.0, 0.0, ""),
+}
+
+# TextBase.JustificationType (API 2.9)
+_PP_JUSTIFICATIONS = (
+    "FromLayer", "TopLeft", "TopCenter", "TopRight", "MiddleLeft", "MiddleCenter", "MiddleRight",
+    "BottomLeft", "BottomCenter", "BottomRight", "BaseLineLeft", "BaseLineCenter", "BaseLineRight",
+    "SpecialLeft", "SpecialCenter", "SpecialRight", "JicSpecialLeft", "JicSpecialCenter", "JicSpecialRight")
+
+_PP_NUMERIC = re.compile(r"^(\d{1,7})(?:\[(\d{1,3})\])?$")
+_PP_IDENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+
+def _pp_property(property_id):
+    """'FUNC_PLCTYPE_ID' / 'FUNC_X[2]' / '20011' / 20011 -> (name, index, number)."""
+    if isinstance(property_id, bool) or property_id is None:
+        raise SchematicValueError(
+            "property_id is required: a FunctionPropertyList name (\"FUNC_PLCTYPE_ID\", "
+            "\"FUNC_CONNECTIONDESIGNATION[1]\") or a property number (\"20011\").")
+    if isinstance(property_id, int):
+        property_id = str(property_id)
+    if not isinstance(property_id, str):
+        raise SchematicValueError("property_id must be a string, got %s." % type(property_id).__name__)
+    p = property_id.strip()
+    m = _PP_NUMERIC.match(p)
+    if m:
+        idx = int(m.group(2)) if m.group(2) else 0
+        if m.group(2) is not None and idx < 1:
+            raise SchematicValueError("property_id: index in %r is 1-based." % p)
+        return "", idx, int(m.group(1))
+    (name, idx), = _parse_props([p], "property_id")
+    return name, idx, -1
+
+
+def live_place_function_property(property_id: str = None, handles: list = None,
+                                 handle: str = None, page: str = None,
+                                 position: str = None, dx: float = None, dy: float = None,
+                                 x: float = None, y: float = None, height: float = None,
+                                 justification: str = None, reposition: bool = None,
+                                 box_source: str = "auto", relation: str = None,
+                                 relation_index: int = 1, make_local: bool = True,
+                                 dry_run: bool = True, allow_real_project: bool = False,
+                                 rollback_on_error: bool = True, max_items: int = 100,
+                                 timeout_seconds: float = 180.0) -> dict:
+    """
+    v8: SHOW a property of a function on the sheet - property placement
+    (Eigenschaftsplatzierung / "Eigenschaftsanordnung", display a property
+    text such as the PLC type designation FUNC_PLCTYPE_ID on a PLC box).
+    WRITES (unless dry_run, the default) - scratch-only unless
+    allow_real_project=True (dry_run only reads).
+
+    For each symbol (Function, PLC box, terminal, ... - any SymbolReference)
+    given by handle:
+      - the property is ALREADY SHOWN       -> nothing ("alreadyVisible"),
+      - a placement of it exists but hidden -> made visible ("madeVisible";
+        IsVisible=true + IsSetAsVisible=Visible) - no second text is added,
+      - none exists                         -> a new PropertyPlacement is
+        created (PropertyPlacement.Create(symbol, AnyPropertyId), API 2.9),
+        made visible, sized and placed ("created").
+    Many symbols in ONE call (handles=[...], one LockingStep); every handle
+    and the property are checked before the first write; on an error all
+    changes of this call are undone (rollback_on_error).
+
+    A symbol that uses its variant's placements (UseLocalPropertyPlacements
+    false) is switched to local placements first
+    (SwitchLocalPropertyPlacements(true), as in the API 2.9 example) -
+    make_local=False refuses instead.
+
+    Args:
+        property_id: FunctionPropertyList name, e.g. "FUNC_PLCTYPE_ID" (PLC type
+            designation), "FUNC_TECHNICAL_CHARACTERISTIC", "FUNC_PLCRACK",
+            "FUNC_PLCSOCKET", optionally indexed "FUNC_X[2]"; or the property
+            number as a string, "20011". The value is read per function
+            ("propertyValue" - an EMPTY value is warned about: the text would
+            show nothing).
+        handles / handle: the symbols (from live_read_function_properties or
+            live_read_page; session-scoped). At most max_items (default 100).
+        page: optional - resolve the handles on this page only (faster than
+            the whole project).
+        position: where the NEW text goes (and an existing one when moved):
+            "above_top_left" (default; justification BottomLeft, dy=+1 mm),
+            "above_top_right", "below_bottom_left", "below_bottom_right",
+            "inside_top_left", "absolute" (x, y required) or "keep" (where
+            EPLAN puts it / where it is).
+            Relative positions use the symbol outline: GetLogicalArea, else
+            GetBoundingBox (box_source "auto" / "logical_area" /
+            "bounding_box"; both are reported per item).
+        dx, dy: offset in mm added to the point (defaults per position).
+        x, y: page mm for position="absolute".
+        height: text height in mm. Default: like the symbol's other visible
+            property texts ("heightSource"); existing texts keep theirs.
+        justification: TextBase.JustificationType name (BottomLeft, TopLeft,
+            ...); default per position.
+        reposition: move an EXISTING text to the position too. Default: only
+            when position was given explicitly.
+        relation, relation_index: the 4-argument Create(..., RelationType,
+            int) for article properties (e.g. relation name of
+            PropertyPlacement.RelationType); omit for function properties.
+        make_local: see above (default True).
+        dry_run: default True - reports per symbol "action", "before",
+            "targetPoint", "height", "boxSource" and changes nothing.
+        allow_real_project: must be True to write outside the scratch root.
+        rollback_on_error: default True.
+        timeout_seconds: default 180.
+
+    Returns:
+        {"success", "dryRun", "propertyId", "counts" {action/result: n},
+         "items": [{handle, name, clrType, propertyValue, existing, action,
+         before, targetPoint, justification, height, heightSource, boxSource,
+         logicalArea, boundingBox, useLocalPropertyPlacements, and after a real
+         run: result, after {handle, text, visible, setAsVisible, location,
+         boundingBox, height}, locationDelta, textNearTarget, switchedToLocal}],
+         "warnings"}. A failed write: success false, errorType "ROLLED_BACK"
+        (or "PARTIAL" with rollback_on_error=False), "failedAt" {handle, step,
+        error}. Check the result with live_read_page(...,
+        include_property_placements=True).
+    """
+    try:
+        pname, pidx, pnum = _pp_property(property_id)
+        if handles is not None and not isinstance(handles, (list, tuple)):
+            raise SchematicValueError("handles must be a list of strings (use handle= for one).")
+        hl = []
+        for v in ([handle] if handle else []) + list(handles or []):
+            if not isinstance(v, str) or not v.strip():
+                raise SchematicValueError("handles entries must be non-empty strings, got %r." % (v,))
+            if v.strip() not in hl:
+                hl.append(v.strip())
+        if not hl:
+            raise SchematicValueError("Pass handle='...' or handles=[...] (symbols from live_read_function_properties / live_read_page).")
+        mx = cs_int(max_items, "max_items", minimum=1, maximum=500)
+        if len(hl) > mx:
+            raise SchematicValueError("%d handles, more than max_items=%d - nothing changed." % (len(hl), mx))
+        pos = position if position is not None else "above_top_left"
+        if pos not in _PP_POSITIONS:
+            raise SchematicValueError("position must be one of %s, got %r." % (", ".join(_PP_POSITIONS), position))
+        ddx, ddy, djust = _PP_POSITIONS[pos]
+        if pos == "absolute" and (x is None or y is None):
+            raise SchematicValueError("position='absolute' needs x and y (page mm).")
+        just = djust
+        if justification is not None:
+            match = [j for j in _PP_JUSTIFICATIONS if j.lower() == str(justification).lower()]
+            if not match:
+                raise SchematicValueError("justification must be one of %s, got %r." % (", ".join(_PP_JUSTIFICATIONS), justification))
+            just = match[0]
+        if box_source not in ("auto", "logical_area", "bounding_box"):
+            raise SchematicValueError("box_source must be 'auto', 'logical_area' or 'bounding_box', got %r." % (box_source,))
+        hv = -1.0
+        if height is not None:
+            hv = float(cs_double(height, "height"))
+            if not 0.1 <= hv <= 100:
+                raise SchematicValueError("height must be 0.1 .. 100 mm, got %r." % (height,))
+        rel = ""
+        if relation:
+            if not isinstance(relation, str) or not _PP_IDENT.match(relation.strip()):
+                raise SchematicValueError("relation must be a PropertyPlacement.RelationType name, got %r." % (relation,))
+            rel = relation.strip()
+        repos = bool(reposition) if reposition is not None else (position is not None)
+        body = ("" if dry_run else _guard_prelude(allow_real_project)) + _fill(
+            _PLACE_PP_BODY,
+            V8HANDLES=_cs_str_array(hl),
+            V8PAGE='"%s"' % cs_escape(cs_text(page, "page", allow_empty=True)),
+            V8PNAME='"%s"' % cs_escape(pname),
+            V8PIDX=str(pidx),
+            V8PNUM=str(pnum),
+            V8POS='"%s"' % pos,
+            V8DX=cs_double(ddx if dx is None else dx, "dx"),
+            V8DY=cs_double(ddy if dy is None else dy, "dy"),
+            V8X=cs_double(0.0 if x is None else x, "x"),
+            V8Y=cs_double(0.0 if y is None else y, "y"),
+            V8HEIGHT=cs_double(hv, "height"),
+            V8JUST='"%s"' % just,
+            V8REPOS=cs_bool(repos),
+            V8REL='"%s"' % rel,
+            V8RELIDX=str(cs_int(relation_index, "relation_index", minimum=0, maximum=999)),
+            V8LOCAL=cs_bool(make_local),
+            V8DRY=cs_bool(dry_run),
+            V8ROLLBACK=cs_bool(rollback_on_error),
+            V8BOXSRC='"%s"' % box_source,
+        )
+    except (SchematicValueError, TypeError, ValueError) as exc:
+        return _err(exc)
+
+    out = _shape_keep(_execute_script(
+        _script(_cls("PlaceProp"), body,
+                extra_helpers=_HELPERS_SCHEMATIC + _HELPERS_PROPS + _HELPERS_PP),
+        timeout=timeout_seconds,
+    ), keep=("items", "failedAt", "rolledBack", "rollbackErrors", "project"))
+    if not out.get("success"):
+        return out
+    out["dryRun"] = bool(dry_run)
+    counts, empty, warnings = {}, [], []
+    for it in out.get("items") or []:
+        key = it.get("result") or it.get("action") or "?"
+        counts[key] = counts.get(key, 0) + 1
+        for k in ("before", "after"):
+            if isinstance(it.get(k), dict):
+                disp, _ = multilang_display(it[k].get("text"))
+                if disp is not None:
+                    it[k]["displayText"] = disp
+        if "propertyValue" in it and not str(it.get("propertyValue") or "").strip():
+            empty.append(it.get("name") or it.get("handle"))
+        if it.get("textNearTarget") is False:
+            warnings.append("%s: the text was not drawn near the requested point (locationDelta %s) - check with "
+                            "live_read_page(include_property_placements=True)." % (it.get("name") or it.get("handle"),
+                                                                                  it.get("locationDelta")))
+    out["counts"] = counts
+    if empty:
+        warnings.insert(0, "The property is EMPTY on %d symbol(s) - the text shows nothing there: %s"
+                        % (len(empty), ", ".join(empty[:20])))
+    if warnings:
+        out["warnings"] = warnings
+    if out.get("failedAt"):
+        out["success"] = False
+        out["errorType"] = "ROLLED_BACK" if rollback_on_error else "PARTIAL"
+        fa = out["failedAt"]
+        out["error"] = ("Writing failed at %s (step %s): %s. %s" % (
+            fa.get("handle"), fa.get("step"), fa.get("error"),
+            "All changes of this call were undone." if rollback_on_error and not out.get("rollbackErrors")
+            else "Changes before it stay - check the page."))
+    return out
+
+
+# ---------------------------------------------------------------------------
+# v8  add article references to functions
+# ---------------------------------------------------------------------------
+# inbox 2026-10-30_eplan_ni_orodja_dodaj_artikel_funkciji_brez_artikla.md +
+# coordinator 2026-10-30 (user: module article + BaseUnit as 2nd article on
+# every Siemens PLC box, for the parts list).
+# API 2.9: Function.AddArticleReference(string strArticleNR, string strVariantNR,
+# uint nCount) -> ArticleReference ("stores the article from the system article
+# database in the project"; CannotAddArticleException e.g. a 2nd article on a
+# 2D function of category ArticlePlacement); RemoveArticleReference (rollback).
+# Live test v3 S2: AddArticleReference (3 overloads) present on 2.9.
+
+_HELPERS_ART = r'''
+    // ---- v8: live_add_function_articles ------------------------------------
+    static List<object> ArtList(object fn)
+    {
+        List<object> list = new List<object>();
+        object refs = TryRead(fn, "ArticleReferences", null);
+        if (!(refs is IEnumerable)) return list;
+        foreach (object r in (IEnumerable)refs)
+        {
+            if (r == null) continue;
+            Dictionary<string, object> d = new Dictionary<string, object>();
+            string pn = SafeText(TryRead(r, "PartNr", null));
+            d["partNr"] = pn == null ? "" : pn;
+            string vn = SafeText(TryRead(r, "VariantNr", null));
+            if (vn != null) d["variant"] = vn;
+            object cnt = TryRead(r, "Count", null);
+            if (cnt != null) { try { d["count"] = Convert.ToInt32(cnt); } catch { } }
+            list.Add(d);
+        }
+        return list;
+    }
+
+    static bool ArtHas(List<object> arts, string partNr)
+    {
+        foreach (object a in arts)
+            if (string.Equals((string)((Dictionary<string, object>)a)["partNr"], partNr, StringComparison.OrdinalIgnoreCase))
+                return true;
+        return false;
+    }
+
+    static int PinCount(object fn)
+    {
+        object cps = TryRead(fn, "GraphicalConnectionPoints", null);
+        int n = 0;
+        if (cps is IEnumerable) foreach (object p in (IEnumerable)cps) if (p != null) n++;
+        return n;
+    }
+
+    // functions per device tag (box + its connection points / sub-functions)
+    static Dictionary<string, int> DtCounts(object project, List<string> dts)
+    {
+        Dictionary<string, int> c = new Dictionary<string, int>();
+        foreach (string dt in dts) c[dt] = 0;
+        foreach (object fn in AllFunctions(project))
+        {
+            if (fn == null) continue;
+            string dt = DtPart(SafeText(TryRead(fn, "Name", null)));
+            if (dt != null && c.ContainsKey(dt)) c[dt] = c[dt] + 1;
+        }
+        return c;
+    }
+'''
+
+_ADD_ART_BODY = '''
+            string[] v8handles = V8HANDLES;
+            string v8page = V8PAGE;
+            string[] aNr = V8ANR;
+            string[] aVar = V8AVAR;
+            int[] aCnt = V8ACNT;
+            bool v8dup = V8DUP;
+            bool v8dry = V8DRY;
+            bool v8rollback = V8ROLLBACK;
+
+            List<string> wanted = new List<string>(v8handles);
+            Dictionary<string, object> byH = new Dictionary<string, object>();
+            if (v8page.Length > 0)
+            {
+                object pg = FindPage(project, v8page);
+                foreach (object pl in PagePlacements(pg))
+                {
+                    if (pl == null) continue;
+                    string h0 = Handle(pl);
+                    if (h0 != null && wanted.Contains(h0) && !byH.ContainsKey(h0)) byH[h0] = pl;
+                }
+            }
+            else
+            {
+                foreach (object fn in AllFunctions(project))
+                {
+                    if (fn == null) continue;
+                    string h0 = Handle(fn);
+                    if (h0 != null && wanted.Contains(h0) && !byH.ContainsKey(h0)) byH[h0] = fn;
+                    if (byH.Count == wanted.Count) break;
+                }
+            }
+            List<string> missing = new List<string>();
+            foreach (string h in wanted) if (!byH.ContainsKey(h)) missing.Add(h);
+            if (missing.Count > 0)
+                throw new Exception("Nothing written: " + missing.Count + " handle(s) not found" +
+                    (v8page.Length > 0 ? " on page '" + v8page + "'" : " among the project's functions") + ": " +
+                    string.Join(", ", missing.ToArray()) + ". Handles are session-scoped - re-read them.");
+            MethodInfo addM = null;
+            foreach (string h in wanted)
+            {
+                object fn = byH[h];
+                if (!IsFunctionObject(fn))
+                    throw new Exception("Nothing written: " + h + " is a " + fn.GetType().Name + ", not a function.");
+                MethodInfo m = MethodByShape(fn.GetType(), "AddArticleReference", new string[] { "String", "String", "UInt32" }, false);
+                if (m == null)
+                    throw new Exception("Nothing written: " + fn.GetType().Name + " has no AddArticleReference(String, String, UInt32). " +
+                        MemberList(fn.GetType(), true));
+                if (addM == null) addM = m;
+            }
+            results["addApi"] = addM.ToString();
+
+            // ---- plan --------------------------------------------------------
+            List<string> dts = new List<string>();
+            List<object> items = new List<object>();
+            foreach (string h in wanted)
+            {
+                object fn = byH[h];
+                Dictionary<string, object> it = new Dictionary<string, object>();
+                it["handle"] = h;
+                it["clrType"] = fn.GetType().Name;
+                string nm = SafeText(TryRead(fn, "Name", null));
+                it["name"] = nm == null ? "" : nm;
+                it["page"] = FnPageName(fn);
+                object main = TryRead(fn, "IsMainFunction", null);
+                if (main != null) { try { it["isMainFunction"] = Convert.ToBoolean(main); } catch { } }
+                object cat = TryRead(fn, "Category", null);
+                if (cat != null) it["category"] = SafeText(cat);
+                List<object> before = ArtList(fn);
+                it["articlesBefore"] = before;
+                List<object> plan = new List<object>();
+                List<string> planned = new List<string>();
+                for (int i = 0; i < aNr.Length; i++)
+                {
+                    Dictionary<string, object> pa = new Dictionary<string, object>();
+                    pa["partNr"] = aNr[i];
+                    pa["variant"] = aVar[i];
+                    pa["count"] = aCnt[i];
+                    bool present = ArtHas(before, aNr[i]) || planned.Contains(aNr[i].ToUpperInvariant());
+                    pa["action"] = present && !v8dup ? "alreadyPresent" : "add";
+                    if ((string)pa["action"] == "add") planned.Add(aNr[i].ToUpperInvariant());
+                    plan.Add(pa);
+                }
+                it["plan"] = plan;
+                it["connectionDesignationsBefore"] = ConnDesignations(FnProps(fn));
+                it["pinsBefore"] = PinCount(fn);
+                string dt = DtPart(nm);
+                if (dt != null && dt.Length > 0 && !dts.Contains(dt)) dts.Add(dt);
+                items.Add(it);
+            }
+            results["items"] = items;
+            results["dryRun"] = v8dry;
+
+            // ---- write -------------------------------------------------------
+            if (!v8dry)
+            {
+                Dictionary<string, int> dtBefore = DtCounts(project, dts);
+                List<object[]> undo = new List<object[]>();
+                Dictionary<string, object> failedAt = null;
+                int added = 0;
+                foreach (object o in items)
+                {
+                    Dictionary<string, object> it = (Dictionary<string, object>)o;
+                    string h = (string)it["handle"];
+                    object fn = byH[h];
+                    foreach (object po in (List<object>)it["plan"])
+                    {
+                        Dictionary<string, object> pa = (Dictionary<string, object>)po;
+                        if ((string)pa["action"] != "add") continue;
+                        try
+                        {
+                            MethodInfo m = MethodByShape(fn.GetType(), "AddArticleReference", new string[] { "String", "String", "UInt32" }, false);
+                            object ar = Call(m, fn, new object[] { (string)pa["partNr"], (string)pa["variant"], (uint)(int)pa["count"] });
+                            undo.Add(new object[] { fn, ar });
+                            pa["result"] = "added";
+                            added++;
+                        }
+                        catch (Exception exa)
+                        {
+                            failedAt = new Dictionary<string, object>();
+                            failedAt["handle"] = h;
+                            failedAt["partNr"] = pa["partNr"];
+                            failedAt["error"] = Flatten(exa);
+                            break;
+                        }
+                    }
+                    if (failedAt != null) break;
+                }
+                if (failedAt != null)
+                {
+                    results["failedAt"] = failedAt;
+                    if (v8rollback)
+                    {
+                        int rb = 0;
+                        List<string> rbErr = new List<string>();
+                        for (int k = undo.Count - 1; k >= 0; k--)
+                        {
+                            try
+                            {
+                                MethodInfo rm = MethodByShape(undo[k][0].GetType(), "RemoveArticleReference", new string[] { "" }, false);
+                                if (rm == null) throw new Exception("no RemoveArticleReference(1)");
+                                Call(rm, undo[k][0], new object[] { undo[k][1] });
+                                rb++;
+                            }
+                            catch (Exception exr) { rbErr.Add(Flatten(exr)); }
+                        }
+                        results["rolledBack"] = rb;
+                        if (rbErr.Count > 0) results["rollbackErrors"] = rbErr;
+                    }
+                }
+                results["addedCount"] = added;
+                // ---- read back: articles appended, connections unchanged? --------
+                Dictionary<string, int> dtAfter = DtCounts(project, dts);
+                bool anyConn = false;
+                foreach (object o in items)
+                {
+                    Dictionary<string, object> it = (Dictionary<string, object>)o;
+                    object fn = byH[(string)it["handle"]];
+                    if (!IsValidObj(fn)) { it["functionGone"] = true; anyConn = true; continue; }
+                    List<object> after = ArtList(fn);
+                    it["articlesAfter"] = after;
+                    int nb = ((List<object>)it["articlesBefore"]).Count;
+                    bool ok = after.Count >= nb;
+                    for (int i = 0; i < nb && ok; i++)
+                        ok = string.Equals((string)((Dictionary<string, object>)((List<object>)it["articlesBefore"])[i])["partNr"],
+                                           (string)((Dictionary<string, object>)after[i])["partNr"], StringComparison.OrdinalIgnoreCase);
+                    it["existingKept"] = ok;
+                    bool allIn = true;
+                    foreach (object po in (List<object>)it["plan"])
+                        if (!ArtHas(after, (string)((Dictionary<string, object>)po)["partNr"])) allIn = false;
+                    it["verified"] = ok && (failedAt == null || !v8rollback ? allIn : true);
+                    List<string> cAfter = ConnDesignations(FnProps(fn));
+                    int pAfter = PinCount(fn);
+                    List<string> cBefore = (List<string>)it["connectionDesignationsBefore"];
+                    bool changed = pAfter != (int)it["pinsBefore"] || cAfter.Count != cBefore.Count;
+                    for (int i = 0; i < cAfter.Count && !changed; i++) if (cAfter[i] != cBefore[i]) changed = true;
+                    string dt = DtPart((string)it["name"]);
+                    if (dt != null && dtBefore.ContainsKey(dt) && dtBefore[dt] != dtAfter[dt])
+                    {
+                        changed = true;
+                        it["functionsWithTagBefore"] = dtBefore[dt];
+                        it["functionsWithTagAfter"] = dtAfter[dt];
+                    }
+                    it["connectionsChanged"] = changed;
+                    if (changed) { it["connectionDesignationsAfter"] = cAfter; it["pinsAfter"] = pAfter; anyConn = true; }
+                }
+                results["connectionsChanged"] = anyConn;
+            }
+'''
+
+_ART_KEYS = {"partnr": "partnr", "partNr": "partnr", "part_nr": "partnr", "variant": "variant", "count": "count"}
+
+
+def _parse_articles(articles):
+    if not isinstance(articles, (list, tuple)) or not articles:
+        raise SchematicValueError(
+            'articles must be a non-empty list, e.g. [{"partnr": "SIE.6ES7131-6BF01-0BA0", "count": 1}, '
+            '{"partnr": "SIE.6ES7193-6BP20-0BA0"}].')
+    out = []
+    for a in articles:
+        if isinstance(a, str):
+            a = {"partnr": a}
+        if not isinstance(a, dict):
+            raise SchematicValueError("articles entries must be objects {partnr, variant, count}, got %r." % (a,))
+        unknown = [k for k in a if k not in _ART_KEYS]
+        if unknown:
+            raise SchematicValueError("articles: unknown key(s) %s (use partnr, variant, count)." % unknown)
+        d = {_ART_KEYS[k]: v for k, v in a.items()}
+        pn = cs_text(d.get("partnr"), "articles.partnr").strip()
+        var = cs_text(str(d.get("variant", "1")), "articles.variant").strip()
+        cnt = cs_int(d.get("count", 1), "articles.count", minimum=1, maximum=9999)
+        out.append((pn, var, cnt))
+    if len(out) > 20:
+        raise SchematicValueError("at most 20 articles per call.")
+    return out
+
+
+def live_add_function_articles(articles: list = None, handles: list = None, handle: str = None,
+                               page: str = None, allow_duplicate: bool = False,
+                               dry_run: bool = True, allow_real_project: bool = False,
+                               allow_missing_article: bool = False, allow_unverified_db: bool = False,
+                               rollback_on_error: bool = True, max_items: int = 100,
+                               timeout_seconds: float = 240.0) -> dict:
+    """
+    v8: ADD article references (parts) to functions - e.g. the module article
+    and, as a SECOND article, its BaseUnit on every Siemens PLC box, so the
+    parts list prints both. Appends to the function's article list
+    (Function.AddArticleReference(partNr, variant, count), API 2.9); existing
+    articles are never removed or changed. WRITES (unless dry_run, the
+    default) - scratch-only unless allow_real_project=True.
+
+    For a function that already has none, one or more articles. To CHANGE an
+    existing part number use live_set_function_properties(replace_article).
+
+    Safety (as replace_article): the parts database preflight first (Access
+    without 64-bit ACE -> PARTS_DB_UNAVAILABLE, nothing sent to EPLAN, no
+    modal dialog); every part number is looked up (parts_db_get_part) - not
+    in the database -> errorType ARTICLE_NOT_IN_DB, nothing written, unless
+    allow_missing_article=true ("articleInDb" per part number). An article the
+    function already has is skipped ("alreadyPresent") unless
+    allow_duplicate. Every handle is checked before the first write; on an
+    error all articles added by this call are removed again
+    (rollback_on_error, RemoveArticleReference).
+
+    EPLAN may change the function when an article brings a connection point
+    pattern: per function "connectionsChanged" compares the connection point
+    designations, the pin count and the number of functions with the same
+    device tag before / after (+ "connectionsChanged" for the whole call).
+
+    Args:
+        articles: [{"partnr": "SIE.6ES7131-6BF01-0BA0", "count": 1},
+            {"partnr": "SIE.6ES7193-6BP20-0BA0"}] - "variant" default "1",
+            "count" default 1; a plain string = partnr. Added in this order.
+        handles / handle: the functions (normally the MAIN function / PLC box;
+            from live_read_function_properties or live_read_page).
+        page: optional - resolve the handles on this page only.
+        allow_duplicate: add a part number the function already has.
+        dry_run: default True - per function "articlesBefore" and "plan"
+            (add / alreadyPresent), nothing written.
+        allow_real_project: must be True to write outside the scratch root.
+        allow_missing_article, allow_unverified_db: see above.
+        rollback_on_error: default True. max_items: default 100.
+
+    Returns:
+        {"success", "dryRun", "articleInDb" {partNr: true/false/null},
+         "items": [{handle, name, page, isMainFunction, category,
+         articlesBefore, plan [{partNr, variant, count, action, result}],
+         articlesAfter, existingKept, verified, connectionsChanged, ...}],
+         "addedCount", "connectionsChanged", "counts", "warnings"}.
+        Failed write: errorType ROLLED_BACK (or PARTIAL), "failedAt"
+        {handle, partNr, error}. EPLAN stores into the project database
+        itself (no save command).
+    """
+    try:
+        arts = _parse_articles(articles)
+        if handles is not None and not isinstance(handles, (list, tuple)):
+            raise SchematicValueError("handles must be a list of strings (use handle= for one).")
+        hl = []
+        for v in ([handle] if handle else []) + list(handles or []):
+            if not isinstance(v, str) or not v.strip():
+                raise SchematicValueError("handles entries must be non-empty strings, got %r." % (v,))
+            if v.strip() not in hl:
+                hl.append(v.strip())
+        if not hl:
+            raise SchematicValueError("Pass handle='...' or handles=[...] (functions from live_read_function_properties).")
+        mx = cs_int(max_items, "max_items", minimum=1, maximum=500)
+        if len(hl) > mx:
+            raise SchematicValueError("%d handles, more than max_items=%d - nothing written." % (len(hl), mx))
+        body = ("" if dry_run else _guard_prelude(allow_real_project)) + _fill(
+            _ADD_ART_BODY,
+            V8HANDLES=_cs_str_array(hl),
+            V8PAGE='"%s"' % cs_escape(cs_text(page, "page", allow_empty=True)),
+            V8ANR=_cs_str_array([a[0] for a in arts]),
+            V8AVAR=_cs_str_array([a[1] for a in arts]),
+            V8ACNT=_cs_int_array([a[2] for a in arts]),
+            V8DUP=cs_bool(allow_duplicate),
+            V8DRY=cs_bool(dry_run),
+            V8ROLLBACK=cs_bool(rollback_on_error),
+        )
+    except (SchematicValueError, TypeError, ValueError) as exc:
+        return _err(exc)
+
+    # Same parts database preflight as replace_article (v5): nothing reaches
+    # EPLAN when the database would open a modal dialog.
+    blocked = _scripted._parts_db_guard(allow_unverified_db)
+    if blocked:
+        out = dict(blocked)
+        out["error"] = "add articles NOT run, nothing written. " + str(out.get("error") or out.get("message") or "")
+        out["nothingWritten"] = True
+        return out
+    in_db = {}
+    for pn in dict.fromkeys(a[0] for a in arts):
+        in_db[pn] = _article_in_db(pn, allow_unverified_db)
+    missing = [pn for pn, f in in_db.items() if f is False]
+    if missing and not allow_missing_article:
+        return {"success": False, "errorType": "ARTICLE_NOT_IN_DB", "nothingWritten": True, "articleInDb": in_db,
+                "error": ("Nothing written: %s not in the parts database (parts_db_get_part: found false). EPLAN "
+                          "would add an article without description / manufacturer. Pass "
+                          "allow_missing_article=true to add anyway." % ", ".join(missing))}
+
+    out = _shape_keep(_execute_script(
+        _script(_cls("AddArt"), body,
+                extra_helpers=_HELPERS_SCHEMATIC + _HELPERS_PROPS + _HELPERS_ART),
+        timeout=timeout_seconds,
+    ), keep=("items", "failedAt", "rolledBack", "rollbackErrors", "addedCount", "project"))
+    out["articleInDb"] = in_db
+    if not out.get("success"):
+        return out
+    out["dryRun"] = bool(dry_run)
+    counts, warnings = {}, []
+    for it in out.get("items") or []:
+        for pa in it.get("plan") or []:
+            key = pa.get("result") or pa.get("action") or "?"
+            counts[key] = counts.get(key, 0) + 1
+        if it.get("isMainFunction") is False:
+            warnings.append("%s is not the main function - articles normally go on the main function." % it.get("name"))
+        if it.get("connectionsChanged"):
+            warnings.append("%s: EPLAN changed the connection points / functions when the article was added "
+                            "- check the page." % it.get("name"))
+        if not dry_run and it.get("verified") is False:
+            warnings.append("%s: read-back does not show every article (or an existing one moved)." % it.get("name"))
+    out["counts"] = counts
+    undecided = [pn for pn, f in in_db.items() if f is None]
+    if undecided:
+        warnings.append("Could not tell whether %s is in the parts database - check with parts_db_get_part."
+                        % ", ".join(undecided))
+    if missing:
+        warnings.append("%s %s NOT in the parts database (allow_missing_article)."
+                        % (", ".join(missing), "was" if not dry_run else "would be added although"))
+    if warnings:
+        out["warnings"] = warnings
+    if out.get("failedAt"):
+        fa = out["failedAt"]
+        out["success"] = False
+        out["errorType"] = "ROLLED_BACK" if rollback_on_error else "PARTIAL"
+        out["error"] = ("Adding %s to %s failed: %s. %s" % (
+            fa.get("partNr"), fa.get("handle"), fa.get("error"),
+            "Articles added by this call were removed again." if rollback_on_error and not out.get("rollbackErrors")
+            else "Articles added before it stay - check the functions."))
     return out

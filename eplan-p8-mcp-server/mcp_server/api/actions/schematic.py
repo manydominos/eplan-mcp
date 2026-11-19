@@ -16,6 +16,12 @@ Six primitives, in the order a caller uses them:
     live_remove_placements  v7: remove many placements in one call (list of
                             handles, a rectangle, or one macro / device)
 
+v8: live_read_page(include_property_placements=True) also returns the texts
+that show a symbol's properties (PropertyPlacement); the writer is
+live_props.live_place_function_property.
+v8: live_move_placements moves placements (one macro / device, a list, a
+rectangle) by setting Placement.Location - nothing removed or re-inserted.
+
 DESIGN RULES, each of which exists because its absence produced a real failure
 during development:
 
@@ -108,6 +114,7 @@ __all__ = [
     "live_read_page",
     "live_remove_placement",
     "live_remove_placements",
+    "live_move_placements",
     "live_verify_page",
     "live_set_device_tag",
     "live_read_connections",
@@ -642,6 +649,171 @@ _HELPERS_SCHEMATIC = r'''
         foreach (string t in tags)
             if (t != null && t.Length > 0 && NameMatches(name, t)) return true;
         return false;
+    }
+
+    // ---- v8: property placements (texts that SHOW a property of a symbol) ----
+    // API 2.9: SymbolReference.PropertyPlacements (PropertyPlacement[]) and
+    // UseLocalPropertyPlacements; PropertyPlacement.DisplayedProperty
+    // (AnyPropertyId: AsInt, Index, Definition.Name), IsSetAsVisible
+    // (Placement.Visibility: Visible / Invisible / ByLayer / Undetermined),
+    // IsVisible, GetDisplayString(), Contents, Location, Height, Justification,
+    // IsDocked, Relation. Shared by live_read_page and
+    // live_place_function_property, so a write and a later read agree.
+    static int PpInt(object o, string name, int dflt)
+    {
+        if (o == null) return dflt;
+        object v = TryRead(o, name, null);
+        if (v == null) return dflt;
+        try { return Convert.ToInt32(v); } catch { return dflt; }
+    }
+
+    static int PpPropId(object pp)
+    {
+        return PpInt(TryRead(pp, "DisplayedProperty", null), "AsInt", -1);
+    }
+
+    static int PpPropIdx(object pp)
+    {
+        return PpInt(TryRead(pp, "DisplayedProperty", null), "Index", 0);
+    }
+
+    // IsSetAsVisible as its enum name, or null when the member is absent.
+    static string PpVisibility(object pp)
+    {
+        object v = TryRead(pp, "IsSetAsVisible", null);
+        return v == null ? null : SafeText(v);
+    }
+
+    // Shown on the sheet: "Visible", or "ByLayer" with IsVisible true. NOTE (API 2.9):
+    // IsVisible also answers true for a hidden text when GED shows invisible elements.
+    static bool PpShown(object pp)
+    {
+        string s = PpVisibility(pp);
+        bool isVis = false;
+        object iv = TryRead(pp, "IsVisible", null);
+        if (iv != null) { try { isVis = Convert.ToBoolean(iv); } catch { isVis = false; } }
+        if (s == null) return isVis;
+        if (s == "Visible") return true;
+        if (s == "ByLayer") return isVis;
+        return false;
+    }
+
+    // The text as EPLAN draws it: GetDisplayString(), else Contents (MultiLangString).
+    static string PpText(object pp, out string source)
+    {
+        source = null;
+        MethodInfo gd = MethodByShape(pp.GetType(), "GetDisplayString", new string[] { }, false);
+        if (gd != null)
+        {
+            try
+            {
+                object s = gd.Invoke(pp, null);
+                if (s != null) { source = "GetDisplayString"; return SafeText(s); }
+            }
+            catch { }
+        }
+        object c = TryRead(pp, "Contents", null);
+        if (c != null)
+        {
+            MethodInfo ga = MethodByShape(c.GetType(), "GetAsString", new string[] { }, false);
+            if (ga != null)
+            {
+                try
+                {
+                    object s = ga.Invoke(c, null);
+                    if (s != null) { source = "Contents.GetAsString"; return SafeText(s); }
+                }
+                catch { }
+            }
+            string t = SafeText(c);
+            if (t != null) { source = "Contents"; return t; }
+        }
+        return null;
+    }
+
+    static Dictionary<string, object> MinMax(double[] b)
+    {
+        Dictionary<string, object> d = new Dictionary<string, object>();
+        List<double> mn = new List<double>();
+        mn.Add(Math.Round(b[0], 4)); mn.Add(Math.Round(b[1], 4));
+        List<double> mx = new List<double>();
+        mx.Add(Math.Round(b[2], 4)); mx.Add(Math.Round(b[3], 4));
+        d["min"] = mn;
+        d["max"] = mx;
+        return d;
+    }
+
+    static Dictionary<string, object> DumpPropPl(object pp)
+    {
+        Dictionary<string, object> d = new Dictionary<string, object>();
+        d["handle"] = Handle(pp);
+        d["clrType"] = pp.GetType().Name;
+        object id = TryRead(pp, "DisplayedProperty", null);
+        if (id != null)
+        {
+            int n = PpInt(id, "AsInt", -1);
+            if (n >= 0) d["propertyId"] = n;
+            int ix = PpInt(id, "Index", 0);
+            if (ix > 0) d["propertyIndex"] = ix;
+            object def = TryRead(id, "Definition", null);
+            if (def != null)
+            {
+                string nm = SafeText(TryRead(def, "Name", null));
+                if (nm != null && nm.Length > 0) d["propertyName"] = nm;
+            }
+        }
+        string src;
+        string txt = PpText(pp, out src);
+        if (txt != null) { d["text"] = txt; d["textSource"] = src; }
+        string vis = PpVisibility(pp);
+        if (vis != null) d["setAsVisible"] = vis;
+        object iv = TryRead(pp, "IsVisible", null);
+        if (iv != null) { try { d["isVisible"] = Convert.ToBoolean(iv); } catch { } }
+        d["visible"] = PpShown(pp);
+        object loc = TryRead(pp, "Location", null);
+        if (loc != null) { try { d["location"] = PtDict(loc); } catch { } }
+        MethodInfo bbm = MethodByShape(pp.GetType(), "GetBoundingBox", new string[] { }, false);
+        if (bbm != null)
+        {
+            try
+            {
+                object bb = bbm.Invoke(pp, null);
+                double[] b = null;
+                if (bb is IEnumerable) foreach (object p in (IEnumerable)bb) if (p != null) b = BBoxAdd(b, p);
+                if (b != null) d["boundingBox"] = MinMax(b);
+            }
+            catch { }
+        }
+        object h = TryRead(pp, "Height", null);
+        if (h != null) { try { d["height"] = Math.Round(Convert.ToDouble(h), 4); } catch { } }
+        object j = TryRead(pp, "Justification", null);
+        if (j != null) d["justification"] = SafeText(j);
+        object dk = TryRead(pp, "IsDocked", null);
+        if (dk != null) { try { d["docked"] = Convert.ToBoolean(dk); } catch { } }
+        object rel = TryRead(pp, "Relation", null);
+        if (rel != null) d["relation"] = SafeText(rel);
+        return d;
+    }
+
+    // null = this placement carries no property placements (not a SymbolReference).
+    static List<object> DumpPropPls(object sr, int max)
+    {
+        object arr = TryRead(sr, "PropertyPlacements", null);
+        if (!(arr is IEnumerable)) return null;
+        List<object> list = new List<object>();
+        foreach (object pp in (IEnumerable)arr)
+        {
+            if (pp == null) continue;
+            if (list.Count >= max) break;
+            try { list.Add(DumpPropPl(pp)); }
+            catch (Exception ex)
+            {
+                Dictionary<string, object> e = new Dictionary<string, object>();
+                e["error"] = Flatten(ex);
+                list.Add(e);
+            }
+        }
+        return list;
     }
 '''
 
@@ -1703,8 +1875,64 @@ def _pin_point(side, index):
 # 5. Read a page
 # ---------------------------------------------------------------------------
 
+# v8 (inbox 2026-10-30_eplan_live_read_page_brez_prikazanih_lastnosti.md): with
+# include_property_placements=True every symbol placement (Function, PLC box,
+# Terminal, ...) gets "propertyPlacements" - the texts that show its properties.
+# Appended to the read body only when asked, so the default read is unchanged.
+_READ_PP_BODY = '''
+            Dictionary<string, Dictionary<string, object>> v8byH = new Dictionary<string, Dictionary<string, object>>();
+            foreach (object v8o in (List<object>)state["placements"])
+            {
+                Dictionary<string, object> v8d = v8o as Dictionary<string, object>;
+                if (v8d == null || !v8d.ContainsKey("handle") || v8d["handle"] == null) continue;
+                string v8k = v8d["handle"].ToString();
+                if (!v8byH.ContainsKey(v8k)) v8byH[v8k] = v8d;
+            }
+            int v8ppCount = 0;
+            int v8withPp = 0;
+            foreach (object pl in PagePlacements(page))
+            {
+                if (pl == null) continue;
+                string h = Handle(pl);
+                if (h == null || !v8byH.ContainsKey(h)) continue;
+                if (pl.GetType().Name.IndexOf("PropertyPlacement", StringComparison.Ordinal) >= 0)
+                {
+                    v8byH[h]["propertyPlacement"] = DumpPropPl(pl);
+                    continue;
+                }
+                List<object> pps = DumpPropPls(pl, V8PPMAX);
+                if (pps == null) continue;
+                v8byH[h]["propertyPlacements"] = pps;
+                object ul = TryRead(pl, "UseLocalPropertyPlacements", null);
+                if (ul != null) { try { v8byH[h]["useLocalPropertyPlacements"] = Convert.ToBoolean(ul); } catch { } }
+                v8ppCount += pps.Count;
+                v8withPp++;
+            }
+            results["propertyPlacementCount"] = v8ppCount;
+            results["placementsWithPropertyPlacements"] = v8withPp;
+'''
+
+
+def _pp_display(out):
+    """v8: "displayText" for a property placement text in EPLAN's MultiLangString form."""
+    try:
+        from .live_props import multilang_display
+    except ImportError:  # pragma: no cover
+        return
+    for pl in out.get("placements") or []:
+        recs = list(pl.get("propertyPlacements") or [])
+        if isinstance(pl.get("propertyPlacement"), dict):
+            recs.append(pl["propertyPlacement"])
+        for pp in recs:
+            disp, _ = multilang_display(pp.get("text"))
+            if disp is not None:
+                pp["displayText"] = disp
+
+
 def live_read_page(page: str, include_pins: bool = True, limit: int = 200,
-                   types: list = None, timeout_seconds: float = 90.0) -> dict:
+                   types: list = None, timeout_seconds: float = 90.0,
+                   include_property_placements: bool = False,
+                   property_placements_limit: int = 50) -> dict:
     """
     Read one page's full state: every placement, its geometry and its pins.
 
@@ -1731,10 +1959,26 @@ def live_read_page(page: str, include_pins: bool = True, limit: int = 200,
             `limit` is exhausted on graphics before a single device is reached,
             and the page looks empty.
         timeout_seconds: Default 90s.
+        include_property_placements: v8. True: every symbol placement
+            (Function, PLC box, Terminal, ...) also gets
+            "propertyPlacements" - the texts that SHOW its properties
+            (device tag, PLC type designation FUNC_PLCTYPE_ID, technical
+            characteristics, rack/slot, ...), hidden ones included:
+            [{"handle", "propertyId", "propertyIndex", "propertyName",
+            "text" (as displayed), "displayText", "visible",
+            "setAsVisible" (Visible/Invisible/ByLayer), "isVisible",
+            "location", "boundingBox" {min, max}, "height",
+            "justification", "docked", "relation"}] and
+            "useLocalPropertyPlacements". Use with types=["PLC"] or a small
+            limit - a terminal has several texts. Default False (output
+            unchanged). To show a hidden or missing one use
+            live_place_function_property.
+        property_placements_limit: v8, max texts per symbol (default 50).
 
     Returns:
         {"success", "page", "pageType", "gridSize", "size", "placementCount",
          "returned", "truncated", "placements": [...]}
+        (+ v8 "propertyPlacementCount", "placementsWithPropertyPlacements").
 
         Each placement: {"clrType", "handle", "name", "location",
         "boundingBox", "symbol", "pins", "absentMembers"}.
@@ -1757,6 +2001,7 @@ def live_read_page(page: str, include_pins: bool = True, limit: int = 200,
             types = [cs_escape(cs_text(t, "types entry")) for t in types]
             if not types:
                 types = None
+        pp_max = cs_int(property_placements_limit, "property_placements_limit", minimum=1, maximum=500)
     except SchematicValueError as exc:
         return _err(exc)
 
@@ -1768,6 +2013,8 @@ def live_read_page(page: str, include_pins: bool = True, limit: int = 200,
             foreach (KeyValuePair<string, object> kv in state) results[kv.Key] = kv.Value;
             results["handle"] = Handle(page);
 '''
+    if include_property_placements:
+        body += _fill(_READ_PP_BODY, V8PPMAX=str(pp_max))
     body = _fill(
         body,
         PAGENAME='"%s"' % page_cs,
@@ -1782,6 +2029,8 @@ def live_read_page(page: str, include_pins: bool = True, limit: int = 200,
     ))
     if out.get("success"):
         _annotate_pins(out)
+        if include_property_placements:
+            _pp_display(out)
     return out
 
 
@@ -4249,3 +4498,516 @@ def live_place_connected(page: str, to_handle: str, to_pin: int,
         }
     return out
 
+
+# ---------------------------------------------------------------------------
+# v8  move placements (one macro / device, a list, a rectangle)
+# ---------------------------------------------------------------------------
+# Coordinator 2026-10-30 (user: "module lepo razporedi po straneh"). The
+# selection is the SAME C# as live_remove_placements (v7) - its part before
+# "record of the selection" is reused verbatim, so both tools pick exactly the
+# same placements. Moving = Placement.Location set (API 2.9, get/set) on each
+# selected placement; nothing is removed or re-inserted, so handles, device
+# tags, properties and connection points stay. Another page: Placement.Page
+# set (API 2.9: "assigns it to a page ... removes it from its previous page";
+# not for PropertyPlacement) - NOT verified on 2.9, read back and rolled back.
+
+_SELECT_MARK = "            // ---- record of the selection"
+assert _REMOVE_MANY_BODY.count(_SELECT_MARK) == 1
+_SELECT_BODY = _REMOVE_MANY_BODY.split(_SELECT_MARK)[0]
+
+_HELPERS_MOVE = r'''
+    // ---- v8: live_move_placements ------------------------------------------
+    static double[] Shifted(double[] b, double dx, double dy)
+    {
+        if (b == null) return null;
+        double[] r = new double[4];
+        r[0] = b[0] + dx; r[1] = b[1] + dy; r[2] = b[2] + dx; r[3] = b[3] + dy;
+        return r;
+    }
+
+    static bool Overlap(double[] a, double[] b, double tol)
+    {
+        if (a == null || b == null) return false;
+        return a[0] < b[2] - tol && b[0] < a[2] - tol && a[1] < b[3] - tol && b[1] < a[3] - tol;
+    }
+
+    static double[] LocXY(object pl)
+    {
+        object loc = TryRead(pl, "Location", null);
+        if (loc == null) return null;
+        Dictionary<string, object> d = PtDict(loc);
+        double[] r = new double[2];
+        r[0] = Convert.ToDouble(d["x"]); r[1] = Convert.ToDouble(d["y"]);
+        return r;
+    }
+
+    static void SetLocXY(object pl, double x, double y)
+    {
+        PropertyInfo pi = GetWritable(pl.GetType(), "Location");
+        if (pi == null) throw new Exception(pl.GetType().Name + " has no writable Location. " + MemberList(pl.GetType(), false));
+        try { pi.SetValue(pl, MakePoint(pi.PropertyType, x, y), null); }
+        catch (TargetInvocationException tie) { throw new Exception("Location: " + Flatten(tie.InnerException)); }
+    }
+
+    static void SetPageOf(object pl, object page)
+    {
+        PropertyInfo pi = GetWritable(pl.GetType(), "Page");
+        if (pi == null) throw new Exception(pl.GetType().Name + " has no writable Page. " + MemberList(pl.GetType(), false));
+        try { pi.SetValue(pl, page, null); }
+        catch (TargetInvocationException tie) { throw new Exception("Page: " + Flatten(tie.InnerException)); }
+    }
+
+    static bool Near(double a, double b, double tol) { return Math.Abs(a - b) <= tol; }
+
+    static Dictionary<string, object> XYd(double x, double y)
+    {
+        Dictionary<string, object> d = new Dictionary<string, object>();
+        d["x"] = Math.Round(x, 4);
+        d["y"] = Math.Round(y, 4);
+        return d;
+    }
+'''
+
+_MOVE_BODY = '''
+            // ---- v8: move the selection --------------------------------------
+            double mvdx = V8DX;
+            double mvdy = V8DY;
+            List<string> mv = new List<string>();
+            List<string> groupsSkipped = new List<string>();
+            foreach (string h in order)
+            {
+                object pl = pick[h];
+                if (IsGroupPl(pl)) { groupsSkipped.Add(h); continue; }      // members move one by one
+                if (pl.GetType().Name.IndexOf("PropertyPlacement", StringComparison.Ordinal) >= 0) continue;  // follow their symbol
+                mv.Add(h);
+            }
+            if (groupsSkipped.Count > 0) results["groupObjectsNotMoved"] = groupsSkipped.Count;
+            if (V8ABS)
+            {
+                object anc = null;
+                string ah = V8ANCHOR;
+                if (ah.Length > 0)
+                {
+                    if (!pick.ContainsKey(ah)) throw new Exception("Nothing moved: anchor_handle " + ah + " is not in the selection.");
+                    anc = pick[ah];
+                }
+                else foreach (string h in mv) if (IsBoxPl(pick[h])) { anc = pick[h]; break; }
+                if (anc == null) throw new Exception("Nothing moved: to_x/to_y need a box (PLC / *Box) in the selection or anchor_handle.");
+                double[] al = LocXY(anc);
+                if (al == null) throw new Exception("Nothing moved: the anchor has no Location.");
+                mvdx = V8TOX - al[0];
+                mvdy = V8TOY - al[1];
+                Dictionary<string, object> ad = new Dictionary<string, object>();
+                ad["handle"] = Handle(anc);
+                ad["name"] = SafeText(TryRead(anc, "Name", null));
+                ad["from"] = XYd(al[0], al[1]);
+                ad["to"] = XYd(V8TOX, V8TOY);
+                results["anchor"] = ad;
+            }
+            results["dx"] = Math.Round(mvdx, 4);
+            results["dy"] = Math.Round(mvdy, 4);
+            object tpage = page;
+            string tpName = V8TPAGE;
+            bool pageChange = false;
+            if (tpName.Length > 0)
+            {
+                tpage = FindPage(project, tpName);
+                pageChange = Handle(tpage) != Handle(page);
+            }
+            results["targetPage"] = PropText(tpage, "Name");
+            results["pageChange"] = pageChange;
+
+            // ---- planned geometry: outside the page, overlap with other boxes -
+            double[] newSel = null;
+            List<object> movingBoxes = new List<object>();
+            foreach (string h in mv)
+            {
+                double[] nb = Shifted(BBoxOf(pick[h]), mvdx, mvdy);
+                if (nb == null) continue;
+                if (newSel == null) { newSel = new double[4]; newSel[0] = nb[0]; newSel[1] = nb[1]; newSel[2] = nb[2]; newSel[3] = nb[3]; }
+                else { newSel[0] = Math.Min(newSel[0], nb[0]); newSel[1] = Math.Min(newSel[1], nb[1]);
+                       newSel[2] = Math.Max(newSel[2], nb[2]); newSel[3] = Math.Max(newSel[3], nb[3]); }
+                if (IsBoxPl(pick[h])) movingBoxes.Add(pick[h]);
+            }
+            if (newSel != null) results["newSelectionBox"] = MinMax(newSel);
+            bool outside = false;
+            object psize = TryRead(tpage, "Size", null);
+            if (psize != null && newSel != null)
+            {
+                Dictionary<string, object> ps = PtDict(psize);
+                double pw = Convert.ToDouble(ps["x"]), ph = Convert.ToDouble(ps["y"]);
+                results["pageSize"] = ps;
+                if (pw > 1 && ph > 1)
+                    outside = newSel[0] < -0.01 || newSel[1] < -0.01 || newSel[2] > pw + 0.01 || newSel[3] > ph + 0.01;
+            }
+            results["outsidePage"] = outside;
+            List<object> overlaps = new List<object>();
+            foreach (object other in PagePlacements(tpage))
+            {
+                if (other == null || !IsBoxPl(other)) continue;
+                string oh = Handle(other);
+                if (oh != null && pick.ContainsKey(oh)) continue;
+                double[] ob = BBoxOf(other);
+                foreach (object b in movingBoxes)
+                {
+                    if (!Overlap(Shifted(BBoxOf(b), mvdx, mvdy), ob, 0.01)) continue;
+                    Dictionary<string, object> o = new Dictionary<string, object>();
+                    o["moving"] = SafeText(TryRead(b, "Name", null));
+                    o["existing"] = SafeText(TryRead(other, "Name", null));
+                    o["existingHandle"] = oh;
+                    overlaps.Add(o);
+                    if (overlaps.Count >= 20) break;
+                }
+                if (overlaps.Count >= 20) break;
+            }
+            results["overlapsExistingBoxes"] = overlaps;
+            if (refused == null && outside && !V8ALLOWOUT)
+            {
+                refused = "OUTSIDE_PAGE";
+                refusedWhy = "The moved selection would lie outside the page - nothing moved (allow_outside_page=true to force).";
+            }
+            if (refused == null && overlaps.Count > 0 && !V8ALLOWOVER)
+            {
+                refused = "OVERLAP";
+                refusedWhy = overlaps.Count + " box(es) would overlap a box already on the page - nothing moved (allow_overlap=true to force).";
+            }
+
+            // ---- record of the selection ---------------------------------------
+            List<object> items = new List<object>();
+            Dictionary<string, int> byType = new Dictionary<string, int>();
+            Dictionary<string, int> byReason = new Dictionary<string, int>();
+            foreach (string h in mv)
+            {
+                object pl = pick[h];
+                items.Add(PickRecord(pl, h, why[h], false));
+                string tn = pl.GetType().Name;
+                byType[tn] = byType.ContainsKey(tn) ? byType[tn] + 1 : 1;
+                byReason[why[h]] = byReason.ContainsKey(why[h]) ? byReason[why[h]] + 1 : 1;
+            }
+            results["selectedCount"] = mv.Count;
+            results["countsByType"] = byType;
+            results["countsByReason"] = byReason;
+            results["items"] = items;
+            if (refused != null) { results["refused"] = refused; results["refusedReason"] = refusedWhy; }
+            if (mv.Count == 0) warnings.Add("Nothing selected.");
+            results["warnings"] = warnings;
+
+            if (!v7dry && refused == null && mv.Count > 0)
+            {
+                // before: location, box, name, the symbol's property texts
+                Dictionary<string, double[]> oldLoc = new Dictionary<string, double[]>();
+                Dictionary<string, double[]> oldBox = new Dictionary<string, double[]>();
+                Dictionary<string, string> oldName = new Dictionary<string, string>();
+                Dictionary<string, List<object[]>> oldPp = new Dictionary<string, List<object[]>>();
+                int connBefore = 0;
+                foreach (object pl in PagePlacements(page)) if (pl != null && pl.GetType().Name.IndexOf("Connection", StringComparison.Ordinal) >= 0) connBefore++;
+                foreach (string h in mv)
+                {
+                    object pl = pick[h];
+                    oldLoc[h] = LocXY(pl);
+                    oldBox[h] = BBoxOf(pl);
+                    oldName[h] = SafeText(TryRead(pl, "Name", null));
+                    object arr = TryRead(pl, "PropertyPlacements", null);
+                    List<object[]> pps = new List<object[]>();
+                    if (arr is IEnumerable)
+                        foreach (object pp in (IEnumerable)arr)
+                            if (pp != null) { double[] l = LocXY(pp); if (l != null) pps.Add(new object[] { pp, l }); }
+                    oldPp[h] = pps;
+                }
+                List<string> done = new List<string>();
+                List<object[]> ppDone = new List<object[]>();
+                Dictionary<string, object> failedAt = null;
+                List<string> notShifted = new List<string>();
+                int ppFollowed = 0, ppMoved = 0, ppOther = 0;
+                double mtol = 0.05;
+                foreach (string h in mv)
+                {
+                    object pl = pick[h];
+                    string step = "Location";
+                    try
+                    {
+                        if (oldLoc[h] == null) throw new Exception("no readable Location");
+                        if (pageChange) { step = "Page"; SetPageOf(pl, tpage); }
+                        step = "Location";
+                        done.Add(h);
+                        SetLocXY(pl, oldLoc[h][0] + mvdx, oldLoc[h][1] + mvdy);
+                        // read back: the whole outline must have shifted by (dx, dy)
+                        double[] nb = BBoxOf(pl);
+                        double[] ob = oldBox[h];
+                        double[] nl = LocXY(pl);
+                        bool ok = nl != null && Near(nl[0], oldLoc[h][0] + mvdx, mtol) && Near(nl[1], oldLoc[h][1] + mvdy, mtol);
+                        if (ok && nb != null && ob != null)
+                            ok = Near(nb[0], ob[0] + mvdx, mtol) && Near(nb[1], ob[1] + mvdy, mtol) &&
+                                 Near(nb[2], ob[2] + mvdx, mtol) && Near(nb[3], ob[3] + mvdy, mtol);
+                        if (!ok) notShifted.Add(h);
+                        // the symbol's property texts: followed, or moved here
+                        foreach (object[] q in oldPp[h])
+                        {
+                            double[] was = (double[])q[1];
+                            double[] now = LocXY(q[0]);
+                            if (now == null) continue;
+                            if (Near(now[0], was[0] + mvdx, mtol) && Near(now[1], was[1] + mvdy, mtol)) { ppFollowed++; continue; }
+                            if (V8MOVEPP && Near(now[0], was[0], mtol) && Near(now[1], was[1], mtol))
+                            {
+                                step = "property text";
+                                SetLocXY(q[0], was[0] + mvdx, was[1] + mvdy);
+                                ppDone.Add(q);
+                                ppMoved++;
+                            }
+                            else ppOther++;
+                        }
+                    }
+                    catch (Exception exm)
+                    {
+                        failedAt = new Dictionary<string, object>();
+                        failedAt["handle"] = h;
+                        failedAt["clrType"] = pl.GetType().Name;
+                        failedAt["step"] = step;
+                        failedAt["error"] = Flatten(exm);
+                        break;
+                    }
+                }
+                if (failedAt == null && notShifted.Count > 0)
+                {
+                    failedAt = new Dictionary<string, object>();
+                    failedAt["handle"] = notShifted[0];
+                    failedAt["step"] = "verify";
+                    failedAt["error"] = notShifted.Count + " placement(s) did not shift by (dx, dy) after Location was set";
+                }
+                if (notShifted.Count > 0) results["notShiftedAsExpected"] = notShifted;
+                Dictionary<string, object> ppr = new Dictionary<string, object>();
+                ppr["followed"] = ppFollowed; ppr["movedExplicitly"] = ppMoved; ppr["other"] = ppOther;
+                results["propertyTexts"] = ppr;
+                if (failedAt != null)
+                {
+                    results["failedAt"] = failedAt;
+                    if (V8ROLLBACK)
+                    {
+                        int rb = 0;
+                        List<string> rbErr = new List<string>();
+                        for (int k = ppDone.Count - 1; k >= 0; k--)
+                        {
+                            try { double[] was = (double[])ppDone[k][1]; SetLocXY(ppDone[k][0], was[0], was[1]); rb++; }
+                            catch (Exception exr) { rbErr.Add(Flatten(exr)); }
+                        }
+                        for (int k = done.Count - 1; k >= 0; k--)
+                        {
+                            string h = done[k];
+                            try
+                            {
+                                if (pageChange) SetPageOf(pick[h], page);
+                                SetLocXY(pick[h], oldLoc[h][0], oldLoc[h][1]);
+                                rb++;
+                            }
+                            catch (Exception exr) { rbErr.Add(h + ": " + Flatten(exr)); }
+                        }
+                        results["rolledBack"] = rb;
+                        if (rbErr.Count > 0) results["rollbackErrors"] = rbErr;
+                    }
+                }
+                else
+                {
+                    // same objects, same device tags, on the target page
+                    List<string> lost = new List<string>();
+                    List<string> renamed = new List<string>();
+                    Dictionary<string, bool> onTarget = new Dictionary<string, bool>();
+                    int connAfter = 0;
+                    foreach (object pl in PagePlacements(tpage))
+                    {
+                        if (pl == null) continue;
+                        string h0 = Handle(pl);
+                        if (h0 != null) onTarget[h0] = true;
+                        if (!pageChange && pl.GetType().Name.IndexOf("Connection", StringComparison.Ordinal) >= 0) connAfter++;
+                    }
+                    foreach (string h in mv)
+                    {
+                        if (!IsValidObj(pick[h]) || !onTarget.ContainsKey(h)) { lost.Add(h); continue; }
+                        string n = SafeText(TryRead(pick[h], "Name", null));
+                        if (n != oldName[h]) renamed.Add(h + " " + oldName[h] + " -> " + n);
+                    }
+                    results["movedCount"] = mv.Count;
+                    results["notOnTargetPage"] = lost;
+                    if (renamed.Count > 0) results["renamed"] = renamed;
+                    results["connectionLinesBefore"] = connBefore;
+                    if (!pageChange) results["connectionLinesAfter"] = connAfter;
+                }
+            }
+'''
+
+
+def live_move_placements(page: str, handles: list = None, region: list = None,
+                         macro_of: str = None, dx: float = None, dy: float = None,
+                         to_x: float = None, to_y: float = None, anchor_handle: str = None,
+                         target_page: str = None,
+                         exclude_device_tags: list = None, exclude_handles: list = None,
+                         types: list = None, region_match: str = "inside",
+                         include_group: bool = True, include_box_area: bool = True,
+                         exclude_expand: bool = True, move_property_texts: bool = True,
+                         allow_overlap: bool = False, allow_outside_page: bool = False,
+                         max_items: int = 200, dry_run: bool = True,
+                         allow_real_project: bool = False, rollback_on_error: bool = True,
+                         list_limit: int = 60, timeout_seconds: float = 180.0) -> dict:
+    """
+    v8: MOVE placements on a sheet - one macro / device (PLC box + its
+    connection points + graphics/texts in the box), a list of handles or a
+    rectangle - by (dx, dy) or so that the box's insertion point lands on
+    (to_x, to_y). Use it to lay modules out neatly on their pages. WRITES
+    (unless dry_run, the default) - scratch-only unless
+    allow_real_project=True (dry_run only reads).
+
+    NOTHING is removed or re-inserted: every placement keeps its handle,
+    device tag, properties, articles and connection points
+    (Placement.Location set, API 2.9). Selection exactly as
+    live_remove_placements: pass ONE of handles=[...], region=[x1, y1, x2,
+    y2], macro_of="510S1" (device tag or box handle), with
+    exclude_device_tags / exclude_handles / types / include_group /
+    include_box_area / exclude_expand / region_match as there.
+
+    Args:
+        page: the page the placements are on, e.g. "=AB-C+ET-1/902".
+        dx, dy: shift in mm (either may be omitted = 0).
+        to_x, to_y: instead of dx/dy - the new insertion point (Location) of
+            the box of the selection (the first PLC / *Box, or anchor_handle),
+            e.g. 510S1 on ET-1/902 from (124, 268) to to_x=78, to_y=268.
+        target_page: move to ANOTHER page (Placement.Page set, API 2.9) -
+            NOT verified on EPLAN 2.9; read back ("notOnTargetPage") and
+            rolled back on error. Omit to stay on the page.
+        move_property_texts: a symbol's property texts (device tag, ...) that
+            did not follow the symbol are moved by the same offset (default
+            True; "propertyTexts" {followed, movedExplicitly, other}).
+        allow_overlap: default False - a moved box overlapping another box
+            already on the page -> refused (errorType OVERLAP,
+            "overlapsExistingBoxes").
+        allow_outside_page: default False - selection outside the page
+            (Page.Size) -> refused (OUTSIDE_PAGE).
+        max_items: default 200 (more -> TOO_MANY). dry_run: default True.
+        allow_real_project: must be True to write outside the scratch root.
+        rollback_on_error: default True - on an error, or when a placement
+            did not shift by exactly (dx, dy) ("notShiftedAsExpected"), every
+            placement moved by this call goes back.
+        list_limit: items in the answer (default 60).
+
+    Returns:
+        {"success", "mode", "dryRun", "dx", "dy", "anchor" {handle, name,
+         from, to}, "targetPage", "pageChange", "selectedCount",
+         "countsByType", "countsByReason", "items", "newSelectionBox",
+         "pageSize", "outsidePage", "overlapsExistingBoxes", "warnings",
+         and after a real run: "movedCount", "notOnTargetPage" (must be []),
+         "renamed" (must be absent), "propertyTexts", "connectionLinesBefore",
+         "connectionLinesAfter"}. Refused: errorType OVERLAP / OUTSIDE_PAGE /
+        TOO_MANY / EXCLUDED_HIT (dry_run: "wouldRefuse"). Failed write:
+        errorType ROLLED_BACK (or PARTIAL), "failedAt" {handle, step, error}.
+    """
+    try:
+        page_cs = cs_escape(cs_text(page, "page"))
+        hl = _str_list(handles, "handles")
+        ext = _str_list(exclude_device_tags, "exclude_device_tags", 200)
+        exh = _str_list(exclude_handles, "exclude_handles")
+        tl = _str_list(types, "types", 50)
+        chosen = [n for n, v in (("handles", hl), ("region", region), ("macro_of", macro_of)) if v]
+        if len(chosen) != 1:
+            raise SchematicValueError(
+                "Pass exactly one selector - handles=[...], region=[x1, y1, x2, y2] or "
+                "macro_of='510S1' (got %s)." % (", ".join(chosen) or "none"))
+        rect = [0.0, 0.0, 0.0, 0.0]
+        if region:
+            if isinstance(region, dict):
+                region = [region.get(k) for k in ("x1", "y1", "x2", "y2")]
+            if not isinstance(region, (list, tuple)) or len(region) != 4:
+                raise SchematicValueError("region must be [x1, y1, x2, y2] (page mm), got %r." % (region,))
+            x1, y1, x2, y2 = (float(cs_double(v, "region")) for v in region)
+            rect = [min(x1, x2), min(y1, y2), max(x1, x2), max(y1, y2)]
+            if rect[2] - rect[0] <= 0 or rect[3] - rect[1] <= 0:
+                raise SchematicValueError("region has no area: %r." % (region,))
+        macro = cs_escape(cs_text(macro_of, "macro_of")) if macro_of else ""
+        if region_match not in ("inside", "location"):
+            raise SchematicValueError("region_match must be 'inside' or 'location', got %r." % (region_match,))
+        absolute = to_x is not None or to_y is not None
+        if absolute and (to_x is None or to_y is None):
+            raise SchematicValueError("to_x and to_y go together (the new insertion point of the box).")
+        if absolute and (dx is not None or dy is not None):
+            raise SchematicValueError("Pass dx/dy OR to_x/to_y, not both.")
+        if not absolute and dx is None and dy is None:
+            raise SchematicValueError("Nothing to do: pass dx and/or dy, or to_x and to_y.")
+        if anchor_handle and not absolute:
+            raise SchematicValueError("anchor_handle is only used with to_x / to_y.")
+        mx = cs_int(max_items, "max_items", minimum=1, maximum=5000)
+        ll = cs_int(list_limit, "list_limit", minimum=0, maximum=5000)
+        body = ("" if dry_run else _guard_prelude(allow_real_project)) + _fill(
+            _SELECT_BODY + _MOVE_BODY,
+            PAGENAME='"%s"' % page_cs,
+            V7MODE='"%s"' % ("handles" if hl else "region" if region else "macro"),
+            V7HANDLES=_cs_str_array(hl, "handles"),
+            V7EXTAGS=_cs_str_array(ext, "exclude_device_tags"),
+            V7EXHANDLES=_cs_str_array(exh, "exclude_handles"),
+            V7TYPES=_cs_str_array(tl, "types"),
+            V7RX1=cs_double(rect[0], "region"), V7RY1=cs_double(rect[1], "region"),
+            V7RX2=cs_double(rect[2], "region"), V7RY2=cs_double(rect[3], "region"),
+            V7MACRO='"%s"' % macro,
+            V7DRY=cs_bool(dry_run),
+            V7FULL="false",
+            V7MAX=str(mx),
+            V7SAVEPAGE="false",
+            V7REGIONMATCH='"%s"' % region_match,
+            V7INCGROUP=cs_bool(include_group),
+            V7INCBOX=cs_bool(include_box_area),
+            V7EXEXPAND=cs_bool(exclude_expand),
+            V8DX=cs_double(0.0 if dx is None else dx, "dx"),
+            V8DY=cs_double(0.0 if dy is None else dy, "dy"),
+            V8ABS=cs_bool(absolute),
+            V8TOX=cs_double(0.0 if to_x is None else to_x, "to_x"),
+            V8TOY=cs_double(0.0 if to_y is None else to_y, "to_y"),
+            V8ANCHOR='"%s"' % cs_escape(cs_text(anchor_handle, "anchor_handle", allow_empty=True)),
+            V8TPAGE='"%s"' % cs_escape(cs_text(target_page, "target_page", allow_empty=True)),
+            V8MOVEPP=cs_bool(move_property_texts),
+            V8ALLOWOVER=cs_bool(allow_overlap),
+            V8ALLOWOUT=cs_bool(allow_outside_page),
+            V8ROLLBACK=cs_bool(rollback_on_error),
+        )
+    except (SchematicValueError, TypeError, ValueError) as exc:
+        return _err(exc)
+
+    raw = _execute_script(
+        _script(_cls("MovePl"), body, extra_helpers=_HELPERS_SCHEMATIC + _HELPERS_MOVE),
+        timeout=timeout_seconds,
+    )
+    out = _shape(raw)
+    if not out.get("success"):
+        inner = raw.get("results") if isinstance(raw, dict) else None
+        if isinstance(inner, dict):
+            for k in ("items", "selectedCount", "dx", "dy"):
+                if k in inner and k not in out:
+                    out[k] = inner[k]
+        return out
+    out["mode"] = "handles" if hl else "region" if region else "macro_of"
+    out["dryRun"] = bool(dry_run)
+    items = out.get("items") or []
+    if len(items) > ll:
+        out["items"] = items[:ll]
+        out["itemsTruncated"] = len(items)
+    if not out.get("warnings"):
+        out.pop("warnings", None)
+    if out.get("refused"):
+        out["errorType"] = out.pop("refused")
+        out["error"] = out.pop("refusedReason", "refused")
+        if dry_run:
+            out["wouldRefuse"] = out.pop("errorType")
+            out["wouldRefuseReason"] = out.pop("error")
+        else:
+            out["success"] = False
+            out["movedCount"] = 0
+    elif not dry_run:
+        if out.get("failedAt"):
+            fa = out["failedAt"]
+            out["success"] = False
+            out["errorType"] = "ROLLED_BACK" if rollback_on_error else "PARTIAL"
+            out["error"] = ("Moving failed at %s (step %s): %s. %s" % (
+                fa.get("handle"), fa.get("step"), fa.get("error"),
+                "Every placement moved by this call was put back." if rollback_on_error and not out.get("rollbackErrors")
+                else "Placements moved before it stay moved - check the page."))
+        elif out.get("notOnTargetPage") or out.get("renamed"):
+            out["success"] = False
+            out["errorType"] = "NOT_ON_TARGET"
+            out["error"] = ("After the move %s placement(s) are not on the target page and %s were renamed - "
+                            "check the page." % (len(out.get("notOnTargetPage") or []), len(out.get("renamed") or [])))
+    return out
