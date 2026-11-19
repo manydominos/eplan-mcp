@@ -1,14 +1,32 @@
 {
   "name": "eplan-tools",
   "owner": {
-    "name": "Canary E-cad",
-    "url": "https://github.com/Canary-ECAD"
+    "name": "manydominos",
+    "url": "https://github.com/manydominos"
   },
   "metadata": {
     "description": "The Canary E-cad plugin marketplace for EPLAN Electric P8 and EEC Pro: agent skills for scripting, the EPLAN API and Remote Client, plus the documentation RAG MCP servers.",
     "version": "2.1.0"
   },
   "plugins": [
+    {
+      "name": "eplan-mcp",
+      "source": "./plugin",
+      "version": "1.0.0",
+      "description": "The local EPLAN MCP server (this repository): drives a running EPLAN Electric P8 through Remote Client. Needs uv; enable Remote access in EPLAN.",
+      "author": {
+        "name": "Canary E-cad",
+        "url": "https://github.com/Canary-ECAD"
+      },
+      "homepage": "https://github.com/manydominos/eplan-mcp",
+      "license": "MIT",
+      "keywords": [
+        "eplan",
+        "eplan-p8",
+        "mcp"
+      ],
+      "category": "development"
+    },
     {
       "name": "eplan",
       "source": {
@@ -23,7 +41,14 @@
       },
       "homepage": "https://covaga.dev",
       "license": "MIT",
-      "keywords": ["eplan", "eplan-p8", "eplan-electric-p8", "electrical-engineering", "csharp", "automation"],
+      "keywords": [
+        "eplan",
+        "eplan-p8",
+        "eplan-electric-p8",
+        "electrical-engineering",
+        "csharp",
+        "automation"
+      ],
       "category": "development",
       "strict": false,
       "skills": [
@@ -45,10 +70,19 @@
       },
       "homepage": "https://covaga.dev",
       "license": "MIT",
-      "keywords": ["eplan", "eplan-p8", "eplan-api", "eplan-scripting", "csharp", "automation"],
+      "keywords": [
+        "eplan",
+        "eplan-p8",
+        "eplan-api",
+        "eplan-scripting",
+        "csharp",
+        "automation"
+      ],
       "category": "development",
       "strict": false,
-      "skills": ["./skills/eplan-p8/eplan-scripting"]
+      "skills": [
+        "./skills/eplan-p8/eplan-scripting"
+      ]
     },
     {
       "name": "eec-pro",
@@ -64,10 +98,20 @@
       },
       "homepage": "https://covaga.dev",
       "license": "MIT",
-      "keywords": ["eplan", "eec-pro", "typicals", "job-server", "eox", "electrical-engineering", "automation"],
+      "keywords": [
+        "eplan",
+        "eec-pro",
+        "typicals",
+        "job-server",
+        "eox",
+        "electrical-engineering",
+        "automation"
+      ],
       "category": "development",
       "strict": false,
-      "skills": ["./skills/eec-pro-development"]
+      "skills": [
+        "./skills/eec-pro-development"
+      ]
     }
   ]
 }

@@ -1,0 +1,17 @@
+{
+  "mcpServers": {
+    "eplan": {
+      "command": "uvx",
+      "args": [
+        "--refresh-package",
+        "eplan-mcp",
+        "--from",
+        "${EPLAN_MCP_SOURCE:-eplan-mcp @ https://github.com/manydominos/eplan-mcp/archive/refs/heads/main.zip}",
+        "eplan-mcp"
+      ],
+      "env": {
+        "EPLAN_MCP_MODE": "${EPLAN_MCP_MODE:-discovery}"
+      }
+    }
+  }
+}
