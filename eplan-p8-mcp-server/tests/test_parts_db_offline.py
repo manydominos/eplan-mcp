@@ -58,11 +58,12 @@ def test_get_part_does_not_reference_the_nonexistent_producttopgroup(capture):
     """
     scripted.parts_db_get_part("X")
     cs = capture["cs"]
-    assert "part.ProductTopGroup" not in cs, (
+    assert "ProductTopGroup" not in cs.replace("Enums+ProductTopGroup", ""), (
         "MDPart.ProductTopGroup does not exist; this is the CS1061 that made "
         "the tool return only timeouts"
     )
-    assert "part.GenericProductGroup" in cs
+    # v3: members are read by reflection, by name.
+    assert '"GenericProductGroup"' in cs
 
 
 def test_get_part_stringifies_every_value_before_serialising(capture):
@@ -78,10 +79,11 @@ def test_get_part_stringifies_every_value_before_serialising(capture):
         "these ARTICLE_* values reach the results dict as EPLAN objects rather "
         "than strings, which hangs the JSON serialiser: %s" % raw
     )
+    # v3: every value goes through ReadPartProperty, which returns Str(...).
+    assert "partDict[outKeys[i]] = ReadPartProperty(part, srcNames[i]);" in cs
+    assert "return Str(listProp.GetValue(pl, null));" in cs
     for member in ("ARTICLE_PARTNR", "ARTICLE_DESCR1", "ARTICLE_MANUFACTURER"):
-        assert "Str(props.%s)" % member in cs, (
-            "%s must be flattened with Str() before it is stored" % member
-        )
+        assert '"%s"' % member in cs, "%s must be read" % member
 
 
 def test_get_part_defines_the_str_helper_it_uses(capture):
@@ -125,7 +127,7 @@ def test_query_does_not_look_defaults_up_on_the_property_list(capture):
 def test_query_resolves_against_mdpart_first_then_the_property_list(capture):
     scripted.parts_db_query(limit=5)
     cs = capture["cs"]
-    assert "FindUnambiguous(typeof(MDPart), propName)" in cs
+    assert "FindUnambiguous(part.GetType(), propName)" in cs  # v3: no typeof(MDPart)
     assert "FindUnambiguous(pl.GetType(), articleName)" in cs
 
 
@@ -184,3 +186,48 @@ def test_query_declares_reflection_namespace(capture):
     """The helper uses PropertyInfo/BindingFlags, so the using must be there."""
     scripted.parts_db_query(limit=1)
     assert "using System.Reflection;" in capture["cs"]
+
+
+# ---------------------------------------------------------------------------
+# v3: no compile-time reference to Eplan.EplApi.MasterData (CS0234 on 2.9)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("call", [
+    lambda: scripted.parts_db_query(limit=5),
+    lambda: scripted.parts_db_query(filter_property="PartNr", filter_value="SIE", limit=5),
+    lambda: scripted.parts_db_count(),
+    lambda: scripted.parts_db_count(filter_property="PartNr", filter_value="SIE"),
+    lambda: scripted.parts_db_get_part("SIE.6ES7131-6BF01-0BA0"),
+    lambda: scripted.parts_db_list_product_groups(),
+], ids=["query", "query_filtered", "count", "count_filtered", "get_part", "groups"])
+def test_read_scripts_do_not_reference_masterdata_at_compile_time(capture, call):
+    call()
+    cs = capture["cs"]
+    assert "using Eplan.EplApi.MasterData" not in cs
+    assert "MDPartsManagement()" not in cs, "no statically typed constructor"
+    assert "MDPart part" not in cs and "(MDPart)" not in cs and "typeof(MD" not in cs
+    assert 'FindMdType("Eplan.EplApi.MasterData.' in cs
+    assert '"Eplan.EplApi.MasterDatau"' in cs, "2.9 assembly name must be a load candidate"
+    assert "Newtonsoft.Json.JsonConvert.SerializeObject(results)" in cs
+
+
+def test_read_scripts_close_the_database(capture):
+    scripted.parts_db_query(limit=1)
+    assert "finally { if (db != null) CloseDb(db); }" in capture["cs"]
+
+
+def test_query_filter_property_checked_at_runtime(capture):
+    scripted.parts_db_query(filter_property="PartNr", filter_value="SIE", limit=3)
+    cs = capture["cs"]
+    assert 'string filterProp = "PartNr";' in cs
+    assert 'string filterValue = "SIE";' in cs
+    assert "int limit = 3;" in cs
+
+
+def test_read_scripts_compile_as_portable_on_29(capture):
+    """EPLAN 2.9 has no Newtonsoft in the script compiler: cs_json must convert."""
+    from cs_json import prepare_script
+    scripted.parts_db_get_part("X")
+    out = prepare_script(capture["cs"], "2.9")
+    assert "Newtonsoft" not in out
+    assert "_McpJson(results)" in out

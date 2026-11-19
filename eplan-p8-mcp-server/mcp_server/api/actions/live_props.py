@@ -1,0 +1,861 @@
+"""
+Function properties and window macros in the live object model (EPLAN MCP v3).
+
+Added for a project in EPLAN P8 2.9, notes
+inbox/2026-10-27_eplan_*:
+
+    live_read_function_properties   M-1  read FunctionPropertyList values of
+                                         functions selected by name / page /
+                                         connection point / handle (READ-ONLY)
+    live_set_function_properties    M-6  write FunctionPropertyList values (PLC
+                                         address, channel, function text, ...)
+                                         and optionally swap an article
+                                         reference (WRITE, scratch-guarded)
+    live_insert_window_macro        M-5  Insert.WindowMacro(.ema) on a page at a
+                                         coordinate (WRITE, scratch-guarded)
+
+Same technique as live.py and schematic.py: runtime reflection inside the
+standard _script scaffold (no `using Eplan.EplApi.DataModel;` - CS0234 on the
+script engine), C# 5 only, every caller value through cs_escape / the
+schematic_model validators, results through schematic._shape.
+
+Why a selector richer than "exact name": the connection points of one PLC card
+share ONE device tag (16 functions all named "...-510K3"), so name + limit=1 -
+what live_set_function_text does - cannot address "510K3 point 9". These tools
+select by handle (from live_read_function_properties / live_read_page) or by
+name + connection point designation (+ page), and a write that matches more
+functions than `limit` is refused as a whole rather than applied partially.
+
+The device tag (BMK) is deliberately NOT written here - live_set_device_tag
+already does that with its merge guard.
+
+API names used on EPLAN 2.9 (eplan.help API 2.9):
+    FunctionPropertyList.FUNC_PLCADDRESS                     #20400
+    FunctionPropertyList.FUNC_PLCCHANNEL_DESIGNATION_MANUAL  #20407
+    FunctionPropertyList.FUNC_PLCCHANNEL_DESIGNATION_CALCULATED #20436
+    Insert.WindowMacro(string, int, Page, PointD, Insert.MoveKind) -> StorableObject[]
+      ("Representation type is taken from given page.")
+None of this was run against a live 2.9 here; every lookup that can miss
+throws with what the type really declares, so the first live run documents
+itself (MemberList / PropNamesContaining).
+"""
+
+import os
+import re
+
+from ._base import cs_escape
+from .live import _script
+from .scripted import _execute_script
+from .schematic import _HELPERS_SCHEMATIC, _guard_prelude, _fill, _shape, _cls, _err
+from .schematic_model import SchematicValueError, cs_bool, cs_double, cs_int, cs_text
+
+__all__ = [
+    "live_read_function_properties",
+    "live_set_function_properties",
+    "live_insert_window_macro",
+]
+
+
+# Read when the caller names none. Names that a given EPLAN version does not
+# declare come back in "unknownProperties" (never as silent empty strings).
+DEFAULT_READ_PROPERTIES = (
+    "FUNC_TEXT",
+    "FUNC_PLCADDRESS",
+    "FUNC_PLCCHANNEL_DESIGNATION_MANUAL",
+    "FUNC_PLCCHANNEL_DESIGNATION_CALCULATED",
+    "FUNC_PLCDATATYPE",
+    "FUNC_PLCSYMBOLICADDRESS_MANUAL",
+)
+
+# "FUNC_X" or "FUNC_X[3]" - the name becomes a reflection lookup (a string
+# literal), the index is interpolated as code, so both are validated here.
+_PROP_SPEC = re.compile(r"^([A-Za-z_][A-Za-z0-9_]*)(?:\[(\d{1,3})\])?$")
+
+_MOVE_KINDS = {"absolute": "Absolute", "relative": "Relative"}
+
+# EPLAN's internal MultiLangString encoding, e.g. "de_DE@Text;en_US@Text;" or
+# "??_??@Text;" for "no language set".
+_MLS_SEGMENT = re.compile(r"([a-z?]{2}_[A-Z?]{2})@([^;]*);?")
+
+
+def _parse_props(props, what):
+    """[(name, index)] from ["FUNC_X", "FUNC_Y[2]"]; index 0 = plain property."""
+    if isinstance(props, str) or not isinstance(props, (list, tuple)):
+        raise SchematicValueError(
+            "%s must be a list of property names, e.g. [\"FUNC_PLCADDRESS\", "
+            "\"FUNC_CONNECTIONDESIGNATION[1]\"]." % what)
+    out = []
+    for p in props:
+        if not isinstance(p, str):
+            raise SchematicValueError("%s: %r is not a string." % (what, p))
+        m = _PROP_SPEC.match(p.strip())
+        if not m:
+            raise SchematicValueError(
+                "%s: %r is not a property name. Use the FunctionPropertyList member "
+                "name (FUNC_...), optionally with an index: FUNC_CONNECTIONDESIGNATION[1]."
+                % (what, p))
+        idx = int(m.group(2)) if m.group(2) else 0
+        if m.group(2) is not None and idx < 1:
+            raise SchematicValueError("%s: index in %r is 1-based." % (what, p))
+        out.append((m.group(1), idx))
+    return out
+
+
+def _cs_str_array(values):
+    return "new string[] { " + ", ".join('"%s"' % cs_escape(v) for v in values) + " }"
+
+
+def _cs_int_array(values):
+    return "new int[] { " + ", ".join(str(int(v)) for v in values) + " }"
+
+
+def multilang_display(raw):
+    """
+    Split EPLAN's MultiLangString encoding into {language: text}.
+
+    Returns (display, by_language) or (None, None) when `raw` is not in that
+    encoding (most properties are plain text).
+    """
+    if not isinstance(raw, str) or "@" not in raw:
+        return None, None
+    segs = _MLS_SEGMENT.findall(raw)
+    if not segs or "".join("%s@%s;" % s for s in segs).rstrip(";") != raw.rstrip(";"):
+        return None, None
+    by_lang = {}
+    for lang, text in segs:
+        by_lang[lang] = text
+    display = next((t for _, t in segs if t), "")
+    return display, by_lang
+
+
+def _add_display_texts(functions):
+    for fn in functions or []:
+        props = fn.get("properties")
+        if not isinstance(props, dict):
+            continue
+        disp = {}
+        for k, v in props.items():
+            d, by_lang = multilang_display(v)
+            if d is not None:
+                disp[k] = d
+        if disp:
+            fn["displayText"] = disp
+
+
+def _shape_keep(raw, keep=("details", "project")):
+    """schematic._shape, but a failed write keeps what it already changed."""
+    out = _shape(raw)
+    if not out.get("success") and isinstance(raw, dict):
+        inner = raw.get("results")
+        if isinstance(inner, dict):
+            for k in keep:
+                if k in inner and k not in out:
+                    out[k] = inner[k]
+    return out
+
+
+# ---------------------------------------------------------------------------
+# C# helpers for this module, spliced in ahead of [Start] (after schematic's).
+# ---------------------------------------------------------------------------
+
+_HELPERS_PROPS = r'''
+    // The open project's functions, via DMObjectsFinder (as live_query_functions).
+    static IEnumerable AllFunctions(object project)
+    {
+        Type finderType = FindType("Eplan.EplApi.DataModel.DMObjectsFinder");
+        object finder = Activator.CreateInstance(finderType, new object[] { project });
+        Type filterType = FindType("Eplan.EplApi.DataModel.FunctionsFilter");
+        object filter = Activator.CreateInstance(filterType);
+        MethodInfo getFunctions = RequireMethod(finderType, "GetFunctions",
+            new string[] { filterType.Name }, false);
+        object found = Call(getFunctions, finder, new object[] { filter });
+        if (found == null)
+            throw new Exception("GetFunctions returned null.");
+        return (IEnumerable)found;
+    }
+
+    static Type _fnPropsType;
+
+    static object FnProps(object fn)
+    {
+        PropertyInfo pi = GetPropInfo(fn.GetType(), "Properties");
+        if (pi == null)
+            throw new Exception("Function has no Properties member. " + MemberList(fn.GetType(), false));
+        object p = pi.GetValue(fn, null);
+        if (p == null) throw new Exception("Function.Properties returned null.");
+        if (_fnPropsType == null) _fnPropsType = p.GetType();
+        return p;
+    }
+
+    // An EMPTY PropertyValue throws on ToString(); IsEmpty first, SafeText after.
+    static string PvText(object pv)
+    {
+        if (pv == null) return "";
+        try
+        {
+            PropertyInfo ie = GetPropInfo(pv.GetType(), "IsEmpty");
+            if (ie != null && (bool)ie.GetValue(pv, null)) return "";
+        }
+        catch { }
+        string s = SafeText(pv);
+        return s == null ? "" : s;
+    }
+
+    // idx 0 = the plain declaration, idx > 0 = the [int] declaration.
+    static PropertyInfo FnPropInfo(object props, string name, int idx)
+    {
+        return idx > 0 ? GetPropInfoIdx(props.GetType(), name) : GetPropInfo(props.GetType(), name);
+    }
+
+    // false = the property list does not declare this property at all.
+    static bool ReadFnProp(object props, string name, int idx, out string text)
+    {
+        text = null;
+        PropertyInfo pi = FnPropInfo(props, name, idx);
+        if (pi == null) return false;
+        object v = null;
+        try { v = idx > 0 ? pi.GetValue(props, new object[] { idx }) : pi.GetValue(props, null); }
+        catch (TargetInvocationException tie) { text = "<error: " + Flatten(tie.InnerException) + ">"; return true; }
+        catch (Exception ex) { text = "<error: " + Flatten(ex) + ">"; return true; }
+        text = PvText(v);
+        return true;
+    }
+
+    // Member names of a property list containing `part` - the one-turn fix for
+    // a property name that does not exist on this EPLAN version.
+    static List<string> PropNamesContaining(Type t, string part, int max)
+    {
+        List<string> names = new List<string>();
+        if (t == null) return names;
+        Type cur = t;
+        BindingFlags bf = BindingFlags.Public | BindingFlags.Instance | BindingFlags.DeclaredOnly;
+        while (cur != null && names.Count < max)
+        {
+            if (cur.FullName == "System.Object") break;
+            try
+            {
+                foreach (PropertyInfo pi in cur.GetProperties(bf))
+                {
+                    if (names.Count >= max) break;
+                    if (pi.Name.IndexOf(part, StringComparison.OrdinalIgnoreCase) < 0) continue;
+                    if (!names.Contains(pi.Name)) names.Add(pi.Name);
+                }
+            }
+            catch { }
+            cur = cur.BaseType;
+        }
+        names.Sort();
+        return names;
+    }
+
+    // Connection point designations in index order. The INDEXED form is the
+    // one live_set_connection_designations proved on 2027; the plain form
+    // (pilcrow-joined in EPLAN's dialogs) is the fallback.
+    static List<string> ConnDesignations(object props)
+    {
+        List<string> list = new List<string>();
+        PropertyInfo idxPi = GetPropInfoIdx(props.GetType(), "FUNC_CONNECTIONDESIGNATION");
+        if (idxPi != null)
+        {
+            for (int i = 1; i <= 32; i++)
+            {
+                string s;
+                try { s = PvText(idxPi.GetValue(props, new object[] { i })); }
+                catch { break; }
+                if (s.Length == 0) break;
+                list.Add(s);
+            }
+        }
+        if (list.Count == 0)
+        {
+            string all;
+            if (ReadFnProp(props, "FUNC_CONNECTIONDESIGNATION", 0, out all) && all != null && all.Length > 0
+                && !all.StartsWith("<error"))
+                foreach (string part in all.Split(new char[] { '¶' }))
+                    if (part.Length > 0) list.Add(part);
+        }
+        return list;
+    }
+
+    static string FnPageName(object fn)
+    {
+        object pg = TryRead(fn, "Page", null);
+        if (pg == null) return "";
+        string n = PropText(pg, "Name");
+        return n == null ? "" : n;
+    }
+
+    static List<object> Articles(object fn, List<string> absent)
+    {
+        List<object> list = new List<object>();
+        object refs = TryRead(fn, "ArticleReferences", absent);
+        if (refs is IEnumerable)
+        {
+            foreach (object r in (IEnumerable)refs)
+            {
+                if (r == null) continue;
+                Dictionary<string, object> d = new Dictionary<string, object>();
+                object pn = TryRead(r, "PartNr", null);
+                string pns = pn == null ? null : SafeText(pn);
+                d["partNr"] = pns == null ? "" : pns;
+                object cnt = TryRead(r, "Count", null);
+                if (cnt != null) { string c = SafeText(cnt); if (c != null) d["count"] = c; }
+                list.Add(d);
+            }
+        }
+        return list;
+    }
+
+    static bool FnMatches(object fn, string exactName, string contains, string pageName,
+                          string conn, string handle, string category)
+    {
+        if (handle.Length > 0 && Handle(fn) != handle) return false;
+        string name = PropText(fn, "Name");
+        if (exactName.Length > 0 && name != exactName) return false;
+        if (contains.Length > 0 && !Matches(name, contains)) return false;
+        if (pageName.Length > 0 && FnPageName(fn) != pageName) return false;
+        if (category.Length > 0)
+        {
+            object cat = TryRead(fn, "Category", null);
+            if (!Matches(cat == null ? null : SafeText(cat), category)) return false;
+        }
+        if (conn.Length > 0)
+        {
+            object props;
+            try { props = FnProps(fn); } catch { return false; }
+            if (!ConnDesignations(props).Contains(conn)) return false;
+        }
+        return true;
+    }
+
+    static Dictionary<string, object> DescribeFn(object fn, string[] pNames, int[] pIdx,
+                                                 bool withArticles, List<string> unknown)
+    {
+        Dictionary<string, object> d = new Dictionary<string, object>();
+        List<string> absent = new List<string>();
+        string name = PropText(fn, "Name");
+        d["name"] = name == null ? "" : name;
+        d["handle"] = Handle(fn);
+        d["clrType"] = fn.GetType().Name;
+        d["page"] = FnPageName(fn);
+        object loc = TryRead(fn, "Location", absent);
+        if (loc != null) { try { d["location"] = PtDict(loc); } catch { absent.Add("Location (not a point)"); } }
+        object cat = TryRead(fn, "Category", absent);
+        if (cat != null) { string c = SafeText(cat); if (c != null) d["category"] = c; }
+        object main = TryRead(fn, "IsMainFunction", absent);
+        if (main != null) { try { d["isMainFunction"] = Convert.ToBoolean(main); } catch { } }
+
+        object props = FnProps(fn);
+        d["connectionDesignations"] = ConnDesignations(props);
+        Dictionary<string, object> pv = new Dictionary<string, object>();
+        for (int i = 0; i < pNames.Length; i++)
+        {
+            string key = pIdx[i] > 0 ? pNames[i] + "[" + pIdx[i] + "]" : pNames[i];
+            string t;
+            if (ReadFnProp(props, pNames[i], pIdx[i], out t)) pv[key] = t;
+            else if (!unknown.Contains(key)) unknown.Add(key);
+        }
+        d["properties"] = pv;
+        if (withArticles) d["articles"] = Articles(fn, absent);
+        if (absent.Count > 0) d["absentMembers"] = absent;
+        return d;
+    }
+'''
+
+
+def _selector_subs(name, contains, page, connection_designation, handle, category_contains):
+    """Validated selector values as quoted C# literals for _fill."""
+    def lit(v, what):
+        if v is None:
+            return '""'
+        return '"%s"' % cs_escape(cs_text(v, what, allow_empty=True))
+    return {
+        "SELNAME": lit(name, "name"),
+        "SELCONTAINS": lit(contains, "contains"),
+        "SELPAGE": lit(page, "page"),
+        "SELCONN": lit(connection_designation, "connection_designation"),
+        "SELHANDLE": lit(handle, "handle"),
+        "SELCATEGORY": lit(category_contains, "category_contains"),
+    }
+
+
+# ---------------------------------------------------------------------------
+# M-1  read
+# ---------------------------------------------------------------------------
+
+def live_read_function_properties(name: str = None, contains: str = None, page: str = None,
+                                  connection_designation: str = None, handle: str = None,
+                                  category_contains: str = None, properties: list = None,
+                                  include_articles: bool = True, offset: int = 0,
+                                  limit: int = 200, timeout_seconds: float = 120.0) -> dict:
+    """
+    Read properties of functions in the project currently open in EPLAN - READ-ONLY.
+
+    Unlike live_query_functions (names only) and get_property (GUI selection
+    only), this reads FunctionPropertyList values of functions chosen by name,
+    page, connection point or handle - e.g. the PLC address, channel and
+    function text of every PLC connection point of a card.
+
+    Args:
+        name: Exact identifying function name (device tag), e.g. "=AB-C+DI-510K3".
+        contains: Case-insensitive substring of the name (alternative to name).
+        page: Only functions on this page (exact page name).
+        connection_designation: Only functions that have this connection point
+            designation, e.g. "9" - selects one point of a PLC card whose points
+            all share one device tag.
+        handle: One function by handle (from this tool or live_read_page;
+            valid only within the current EPLAN session).
+        category_contains: Substring of Function.Category, e.g. "PLC".
+        properties: FunctionPropertyList member names to read, optionally
+            indexed: ["FUNC_PLCADDRESS", "FUNC_CONNECTIONDESIGNATION[1]"].
+            Default: FUNC_TEXT, FUNC_PLCADDRESS,
+            FUNC_PLCCHANNEL_DESIGNATION_MANUAL / _CALCULATED, FUNC_PLCDATATYPE,
+            FUNC_PLCSYMBOLICADDRESS_MANUAL. Names this EPLAN version does not
+            declare are listed in "unknownProperties" (with "plcPropertyNames",
+            the PLC-related names it does declare) - never returned as "".
+        include_articles: Also list the article references (part numbers).
+        offset: Skip this many matches (paging; "matched" is the full count).
+        limit: Max functions returned (default 200, max 2000).
+        timeout_seconds: Default 120 - the whole project is walked.
+
+    Returns:
+        {"success", "project", "matched", "offset", "returned", "truncated",
+         "functions": [{"name", "handle", "page", "location", "category",
+         "isMainFunction", "connectionDesignations", "properties": {name: text},
+         "displayText": {name: text without MultiLangString markers},
+         "articles": [{"partNr", "count"}]}], "unknownProperties"}
+    """
+    try:
+        specs = _parse_props(properties if properties is not None
+                             else list(DEFAULT_READ_PROPERTIES), "properties")
+        offset = cs_int(offset, "offset", minimum=0)
+        limit = cs_int(limit, "limit", minimum=1, maximum=2000)
+        subs = _selector_subs(name, contains, page, connection_designation, handle,
+                              category_contains)
+    except SchematicValueError as exc:
+        return _err(exc)
+
+    body = '''
+            string[] pNames = PNAMES;
+            int[] pIdx = PIDX;
+            List<string> unknown = new List<string>();
+            List<object> items = new List<object>();
+            int matched = 0;
+            foreach (object fn in AllFunctions(project))
+            {
+                if (fn == null) continue;
+                if (!FnMatches(fn, SELNAME, SELCONTAINS, SELPAGE, SELCONN, SELHANDLE, SELCATEGORY)) continue;
+                matched++;
+                if (matched <= SKIP) continue;
+                if (items.Count < TAKE) items.Add(DescribeFn(fn, pNames, pIdx, WITHART, unknown));
+            }
+            results["success"] = true;
+            results["matched"] = matched;
+            results["offset"] = SKIP;
+            results["returned"] = items.Count;
+            results["truncated"] = matched > SKIP + items.Count;
+            results["functions"] = items;
+            results["unknownProperties"] = unknown;
+            if (unknown.Count > 0)
+                results["plcPropertyNames"] = PropNamesContaining(_fnPropsType, "PLC", 120);
+'''
+    body = _fill(body,
+                 PNAMES=_cs_str_array([n for n, _ in specs]),
+                 PIDX=_cs_int_array([i for _, i in specs]),
+                 SKIP=str(offset), TAKE=str(limit),
+                 WITHART=cs_bool(include_articles), **subs)
+    out = _shape(_execute_script(
+        _script(_cls("ReadFnProps"), body,
+                extra_helpers=_HELPERS_SCHEMATIC + _HELPERS_PROPS),
+        timeout=timeout_seconds,
+    ))
+    if out.get("success"):
+        _add_display_texts(out.get("functions"))
+        if not out.get("matched"):
+            out["note"] = ("No function matched. Names are exact device tags incl. "
+                           "structure (=..+..-..); use contains= or live_query_functions "
+                           "to find them.")
+    return out
+
+
+# ---------------------------------------------------------------------------
+# M-6  write
+# ---------------------------------------------------------------------------
+
+def live_set_function_properties(values: dict = None, name: str = None, handle: str = None,
+                                 page: str = None, connection_designation: str = None,
+                                 replace_article: dict = None, limit: int = 1,
+                                 allow_real_project: bool = False,
+                                 timeout_seconds: float = 120.0) -> dict:
+    """
+    Set FunctionPropertyList values of functions in the open project. WRITES -
+    scratch-only unless allow_real_project=True.
+
+    Target: `handle` (from live_read_function_properties / live_read_page), or
+    `name` (exact device tag) narrowed by `connection_designation` and/or
+    `page`. If more functions match than `limit`, NOTHING is written. Every
+    property name (and the article to replace) is validated on every target
+    BEFORE the first write. Each write is read back from a fresh fetch.
+
+    The device tag (BMK) is not set here - use live_set_device_tag.
+
+    Args:
+        values: {property: value}, e.g. {"FUNC_PLCADDRESS": "I1.0",
+            "FUNC_PLCCHANNEL_DESIGNATION_MANUAL": "DI0", "FUNC_TEXT": "Ventil 1",
+            "FUNC_CONNECTIONDESIGNATION[1]": "DI0"}. Values are written as text.
+        name, handle, page, connection_designation: the selector (see above).
+        replace_article: {"from": "SIE.6ES7155-6BA00-0CN0",
+            "to": "SIE.6ES7155-6BA01-0CN0"} - replace that article reference's
+            part number on the target (normally the MAIN function of a device).
+        limit: Max functions to modify (default 1).
+        allow_real_project: Must be True to write outside the scratch root.
+        timeout_seconds: Default 120.
+
+    Returns:
+        {"success", "project", "matched", "modified", "details": [{"name",
+         "handle", "page", "properties": [{"property", "previous", "requested",
+         "new", "verified", "route"}], "article": {"from", "to", "previous",
+         "after", "route"}}]}. "previous" makes every edit reversible. A failure
+        mid-way keeps "details" of what was already written. Not saved -
+        the change is on EPLAN's undo stack until the project is saved.
+    """
+    try:
+        if not handle and not name:
+            raise SchematicValueError("Give handle, or name (+ connection_designation / page).")
+        items = []
+        if values is not None:
+            if not isinstance(values, dict):
+                raise SchematicValueError("values must be a dict {property: value}.")
+            for k, v in values.items():
+                if v is None:
+                    raise SchematicValueError("value for %s must not be None (use \"\" to clear)." % k)
+                (pname, pidx), = _parse_props([k], "values")
+                items.append((pname, pidx, cs_text(str(v), "value for %s" % k, allow_empty=True)))
+        art_from = art_to = ""
+        if replace_article is not None:
+            if not isinstance(replace_article, dict) or set(replace_article) != {"from", "to"}:
+                raise SchematicValueError('replace_article must be {"from": partNr, "to": partNr}.')
+            art_from = cs_text(replace_article["from"], "replace_article.from")
+            art_to = cs_text(replace_article["to"], "replace_article.to")
+        if not items and not art_from:
+            raise SchematicValueError("Nothing to write: give values and/or replace_article.")
+        limit = cs_int(limit, "limit", minimum=1, maximum=500)
+        subs = _selector_subs(name, None, page, connection_designation, handle, None)
+    except SchematicValueError as exc:
+        return _err(exc)
+
+    body = _guard_prelude(allow_real_project) + '''
+            string[] wNames = WNAMES;
+            int[] wIdx = WIDX;
+            string[] wVals = WVALS;
+            string artFrom = ARTFROM;
+            string artTo = ARTTO;
+
+            List<object> targets = new List<object>();
+            List<string> seen = new List<string>();
+            foreach (object fn in AllFunctions(project))
+            {
+                if (fn == null) continue;
+                if (!FnMatches(fn, SELNAME, SELCONTAINS, SELPAGE, SELCONN, SELHANDLE, SELCATEGORY)) continue;
+                targets.Add(fn);
+                if (seen.Count < 20) seen.Add(PropText(fn, "Name") + " @" + FnPageName(fn) + " [" + Handle(fn) + "]");
+            }
+            results["matched"] = targets.Count;
+            if (targets.Count == 0)
+                throw new Exception("No function matches the selector - nothing written. " +
+                    "Use live_read_function_properties to find the handle.");
+            if (targets.Count > MAXN)
+                throw new Exception(targets.Count + " functions match, limit is MAXN - nothing written. " +
+                    "Narrow with handle / connection_designation / page. Matches (up to 20): " +
+                    string.Join(" | ", seen.ToArray()));
+
+            // Validate EVERYTHING before the first write.
+            foreach (object fn in targets)
+            {
+                object props = FnProps(fn);
+                for (int i = 0; i < wNames.Length; i++)
+                {
+                    if (FnPropInfo(props, wNames[i], wIdx[i]) == null)
+                        throw new Exception("Property '" + wNames[i] + (wIdx[i] > 0 ? "[" + wIdx[i] + "]" : "") +
+                            "' is not declared by " + props.GetType().FullName + " - nothing written. " +
+                            "PLC-related names here: " + string.Join(", ",
+                            PropNamesContaining(props.GetType(), "PLC", 120).ToArray()));
+                }
+                if (artFrom.Length > 0)
+                {
+                    bool found = false;
+                    foreach (object a in Articles(fn, null))
+                        if (string.Equals((string)((Dictionary<string, object>)a)["partNr"], artFrom,
+                                          StringComparison.OrdinalIgnoreCase)) found = true;
+                    if (!found)
+                        throw new Exception("Function " + PropText(fn, "Name") + " has no article reference '" +
+                            artFrom + "' - nothing written. Articles of the MAIN function are listed by " +
+                            "live_read_function_properties(include_articles=true).");
+                }
+            }
+
+            List<object> details = new List<object>();
+            results["details"] = details;
+            foreach (object fn in targets)
+            {
+                Dictionary<string, object> d = new Dictionary<string, object>();
+                d["name"] = PropText(fn, "Name");
+                d["handle"] = Handle(fn);
+                d["page"] = FnPageName(fn);
+                List<object> plist = new List<object>();
+                d["properties"] = plist;
+                details.Add(d);
+                object props = FnProps(fn);
+                for (int i = 0; i < wNames.Length; i++)
+                {
+                    Dictionary<string, object> pd = new Dictionary<string, object>();
+                    string key = wIdx[i] > 0 ? wNames[i] + "[" + wIdx[i] + "]" : wNames[i];
+                    pd["property"] = key;
+                    string before;
+                    ReadFnProp(props, wNames[i], wIdx[i], out before);
+                    pd["previous"] = before;
+                    pd["requested"] = wVals[i];
+                    string route;
+                    if (wIdx[i] > 0)
+                    {
+                        PropertyInfo ipi = GetPropInfoIdx(props.GetType(), wNames[i]);
+                        object pv = ipi.GetValue(props, new object[] { wIdx[i] });
+                        MethodInfo set = RequireMethod(pv.GetType(), "Set", new string[] { "String" }, false);
+                        Call(set, pv, new object[] { wVals[i] });
+                        route = "indexed getter+Set(string)";
+                    }
+                    else
+                    {
+                        route = SetLiveProp(props, wNames[i], wVals[i]);
+                    }
+                    pd["route"] = route;
+                    string after;
+                    ReadFnProp(FnProps(fn), wNames[i], wIdx[i], out after);
+                    pd["new"] = after;
+                    pd["verified"] = after == wVals[i];
+                    plist.Add(pd);
+                }
+
+                if (artFrom.Length > 0)
+                {
+                    Dictionary<string, object> ad = new Dictionary<string, object>();
+                    ad["from"] = artFrom;
+                    ad["to"] = artTo;
+                    ad["previous"] = Articles(fn, null);
+                    object refs = TryRead(fn, "ArticleReferences", null);
+                    string aroute = null;
+                    foreach (object r in (IEnumerable)refs)
+                    {
+                        if (r == null) continue;
+                        object pn = TryRead(r, "PartNr", null);
+                        string pns = pn == null ? null : SafeText(pn);
+                        if (!string.Equals(pns, artFrom, StringComparison.OrdinalIgnoreCase)) continue;
+                        PropertyInfo w = GetWritable(r.GetType(), "PartNr");
+                        if (w != null)
+                        {
+                            try { w.SetValue(r, artTo, null); aroute = "ArticleReference.PartNr"; }
+                            catch (Exception exW) { ad["partNrError"] = Flatten(exW); }
+                        }
+                        if (aroute == null)
+                        {
+                            object rprops = TryRead(r, "Properties", null);
+                            if (rprops == null)
+                                throw new Exception("ArticleReference has neither a writable PartNr nor Properties. " +
+                                    MemberList(r.GetType(), false));
+                            aroute = "ARTICLEREF_PARTNO " + SetLiveProp(rprops, "ARTICLEREF_PARTNO", artTo);
+                        }
+                        MethodInfo store = MethodByShape(r.GetType(), "StoreToObject", new string[] { }, false);
+                        if (store != null) { Call(store, r, null); aroute += "+StoreToObject"; }
+                        break;
+                    }
+                    ad["route"] = aroute;
+                    List<object> afterArts = Articles(fn, null);
+                    ad["after"] = afterArts;
+                    bool ok = false;
+                    foreach (object a in afterArts)
+                        if (string.Equals((string)((Dictionary<string, object>)a)["partNr"], artTo,
+                                          StringComparison.OrdinalIgnoreCase)) ok = true;
+                    ad["verified"] = ok;
+                    d["article"] = ad;
+                }
+            }
+            results["modified"] = details.Count;
+            results["success"] = true;
+'''
+    body = _fill(body,
+                 WNAMES=_cs_str_array([n for n, _, _ in items]),
+                 WIDX=_cs_int_array([i for _, i, _ in items]),
+                 WVALS=_cs_str_array([v for _, _, v in items]),
+                 ARTFROM='"%s"' % cs_escape(art_from),
+                 ARTTO='"%s"' % cs_escape(art_to),
+                 MAXN=str(limit), **subs)
+    out = _shape_keep(_execute_script(
+        _script(_cls("SetFnProps"), body,
+                extra_helpers=_HELPERS_SCHEMATIC + _HELPERS_PROPS),
+        timeout=timeout_seconds,
+    ))
+    if out.get("success"):
+        bad = [p["property"] for d in out.get("details") or []
+               for p in d.get("properties") or [] if not p.get("verified")]
+        art_bad = [d.get("name") for d in out.get("details") or []
+                   if isinstance(d.get("article"), dict) and not d["article"].get("verified")]
+        if bad or art_bad:
+            out["warning"] = (
+                "Read-back differs from the requested value for %s%s. EPLAN may "
+                "reformat a value (e.g. MultiLangString '??_??@' prefix on FUNC_TEXT) "
+                "or refuse it silently - compare 'new' with 'requested'."
+                % (", ".join(bad) or "-", "; article not verified on " + ", ".join(art_bad) if art_bad else ""))
+    return out
+
+
+# ---------------------------------------------------------------------------
+# M-5  window macro
+# ---------------------------------------------------------------------------
+
+def live_insert_window_macro(page: str, macro_path: str, x: float, y: float,
+                             variant: int = 0, move_kind: str = "absolute",
+                             allow_real_project: bool = False,
+                             timeout_seconds: float = 120.0) -> dict:
+    """
+    Insert a window macro (.ema) on a page at a coordinate. WRITES -
+    scratch-only unless allow_real_project=True.
+
+    Uses Insert.WindowMacro(fileName, variant, page, point, MoveKind). The
+    REPRESENTATION is taken from the page type (EPLAN API): an Overview page
+    gets the macro's overview representation, a Circuit page the multi-line
+    one. A macro without a representation for that page type inserts nothing
+    - reported as a warning, not as success with an empty list.
+
+    Device tags come from the macro (and the project's numbering settings).
+    A tag that already exists elsewhere in the project MERGES into that
+    device - "duplicateNames" lists them; retag with live_set_device_tag.
+
+    Args:
+        page: Exact page name, e.g. "=AB-C+WAGO/900".
+        macro_path: Absolute path of the .ema as seen by EPLAN's machine
+            (e.g. on Z:). Checked to exist before anything runs.
+        x, y: Insertion point in mm (page coordinates).
+        variant: Macro variant, 0-based (0 = A ... 15 = P).
+        move_kind: "absolute" (default) or "relative" (Insert.MoveKind).
+        allow_real_project: Must be True to write outside the scratch root.
+        timeout_seconds: Default 120.
+
+    Returns:
+        {"success", "project", "page", "pageType", "boundSignature",
+         "insertedCount", "inserted": [placement as in live_read_page],
+         "functionNames", "duplicateNames": {name: count elsewhere},
+         "placementsBefore", "placementsAfter", "warning"}
+    """
+    try:
+        page_cs = cs_escape(cs_text(page, "page"))
+        path = cs_text(macro_path, "macro_path")
+        if not path.lower().endswith(".ema"):
+            raise SchematicValueError("macro_path must be a window macro (.ema): %r" % path)
+        if not os.path.isabs(path):
+            raise SchematicValueError("macro_path must be absolute: %r" % path)
+        if not os.path.isfile(path):
+            raise SchematicValueError("macro_path does not exist on the EPLAN machine: %r" % path)
+        xs = cs_double(x, "x")
+        ys = cs_double(y, "y")
+        var = cs_int(variant, "variant", minimum=0, maximum=15)
+        mk = _MOVE_KINDS.get(str(move_kind).strip().lower())
+        if mk is None:
+            raise SchematicValueError("move_kind must be 'absolute' or 'relative', got %r." % move_kind)
+    except SchematicValueError as exc:
+        return _err(exc)
+
+    body = _guard_prelude(allow_real_project) + '''
+            object page = FindPage(project, PAGENAME);
+            results["page"] = PropText(page, "Name");
+            results["pageType"] = PropText(page, "PageType");
+            int before = 0;
+            foreach (object pl in PagePlacements(page)) if (pl != null) before++;
+            results["placementsBefore"] = before;
+
+            Type insType = FindType("Eplan.EplApi.HEServices.Insert");
+            MethodInfo wm = RequireMethod(insType, "WindowMacro",
+                new string[] { "String", "Int32", "Page", "PointD", "MoveKind" }, false);
+            results["boundSignature"] = wm.ToString();
+            ParameterInfo[] ps = wm.GetParameters();
+            object pt = MakePoint(ps[3].ParameterType, POSX, POSY);
+            object mk;
+            try { mk = Enum.Parse(ps[4].ParameterType, MOVEKIND, true); }
+            catch
+            {
+                throw new Exception("MoveKind " + MOVEKIND + " not found; values: " +
+                    string.Join(", ", Enum.GetNames(ps[4].ParameterType)));
+            }
+
+            object ins = Activator.CreateInstance(insType);
+            object ret = null;
+            try { ret = Call(wm, ins, new object[] { MACROPATH, VARIANT, page, pt, mk }); }
+            finally
+            {
+                IDisposable disp = ins as IDisposable;
+                if (disp != null) { try { disp.Dispose(); } catch { } }
+            }
+
+            List<object> placed = new List<object>();
+            List<string> fnNames = new List<string>();
+            List<string> fnHandles = new List<string>();
+            if (ret is IEnumerable)
+            {
+                foreach (object o in (IEnumerable)ret)
+                {
+                    if (o == null) continue;
+                    Dictionary<string, object> pd = DumpPlacement(o, false);
+                    pd["page"] = FnPageName(o);
+                    placed.Add(pd);
+                    if (o.GetType().Name == "Function")
+                    {
+                        string n = PropText(o, "Name");
+                        if (n != null && n.Length > 0 && !fnNames.Contains(n)) fnNames.Add(n);
+                        fnHandles.Add(Handle(o));
+                    }
+                }
+            }
+            results["inserted"] = placed;
+            results["insertedCount"] = placed.Count;
+            results["functionNames"] = fnNames;
+
+            Dictionary<string, object> dup = new Dictionary<string, object>();
+            if (fnNames.Count > 0)
+            {
+                foreach (object fn in AllFunctions(project))
+                {
+                    if (fn == null) continue;
+                    string n = PropText(fn, "Name");
+                    if (n == null || !fnNames.Contains(n)) continue;
+                    if (fnHandles.Contains(Handle(fn))) continue;
+                    dup[n] = dup.ContainsKey(n) ? (int)dup[n] + 1 : 1;
+                }
+            }
+            results["duplicateNames"] = dup;
+
+            int after = 0;
+            foreach (object pl in PagePlacements(page)) if (pl != null) after++;
+            results["placementsAfter"] = after;
+            results["success"] = true;
+'''
+    body = _fill(body,
+                 PAGENAME='"%s"' % page_cs,
+                 MACROPATH='"%s"' % cs_escape(path),
+                 POSX=xs, POSY=ys, VARIANT=str(var),
+                 MOVEKIND='"%s"' % mk)
+    out = _shape(_execute_script(
+        _script(_cls("InsWinMacro"), body,
+                extra_helpers=_HELPERS_SCHEMATIC + _HELPERS_PROPS),
+        timeout=timeout_seconds,
+    ))
+    if out.get("success"):
+        if not out.get("insertedCount"):
+            out["warning"] = (
+                "WindowMacro returned no objects. The representation is taken from "
+                "the page type (%s): the macro may have no representation for it, "
+                "or variant %d may not exist." % (out.get("pageType"), var))
+        if out.get("duplicateNames"):
+            out["duplicateWarning"] = (
+                "Inserted device tag(s) already exist elsewhere in the project and "
+                "are merged into those devices: %s. Retag with live_set_device_tag "
+                "if that is not intended." % ", ".join(sorted(out["duplicateNames"])))
+    return out

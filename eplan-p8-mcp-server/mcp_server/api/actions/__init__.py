@@ -360,6 +360,15 @@ from .schematic import (
     live_place_connected,
 )
 
+# v3 : function properties read/write by name, connection point or
+# handle, and window macro insertion. Same reflection scaffold; writes are
+# scratch-only unless allow_real_project=True.
+from .live_props import (
+    live_read_function_properties,
+    live_set_function_properties,
+    live_insert_window_macro,
+)
+
 # GED interaction (start an interactive placement in the graphical editor)
 from .interaction import (
     start_ged_interaction,
@@ -498,6 +507,8 @@ __all__ = [
     'live_verify_page', 'live_set_device_tag', 'live_read_connections',
     'live_connect_pins_routed', 'live_routing_catalog', 'live_place_connection_symbol',
     'live_place_corner', 'live_place_tnode', 'live_place_connected',
+    'live_read_function_properties', 'live_set_function_properties',
+    'live_insert_window_macro',
     # GED interaction
     'start_ged_interaction', 'insert_device', 'insert_symbol_reference',
     'select_device',

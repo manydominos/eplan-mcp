@@ -516,7 +516,9 @@ def parts_db_query(
     """
     Query parts from the EPLAN parts database.
 
-    Uses MDPartsManagement API for direct database access.
+    Uses the MDPartsManagement API for direct database access, resolved by
+    runtime reflection (v3): EPLAN 2.9's script compiler does not reference
+    Eplan.EplApi.MasterData, so a `using` of it failed with CS0234.
 
     Property names come from two different places, and asking for one from the
     wrong place used to yield an empty string:
@@ -536,7 +538,7 @@ def parts_db_query(
     Args:
         filter_property: Property to filter on. Must be a member of MDPart -
             e.g. "PartNr", "ProductSubGroup", "Variant" - because the filter is
-            a LINQ expression over the part object, not over its property list.
+            applied to the part object, not to its property list.
             "Manufacturer" does NOT work here (it is a property-list field);
             filter on PartNr and inspect the result instead.
         filter_value: Value to match (substring, case-sensitive).
@@ -563,158 +565,13 @@ def parts_db_query(
             "ProductSubGroup",
         ]
 
-    props_array = ", ".join([f'"{cs_escape(p)}"' for p in return_properties])
-
-    filter_code = ""
     if filter_property and filter_value:
         if not _CS_IDENTIFIER.match(filter_property):
             return _identifier_error(filter_property, "filter_property")
-        filter_code = f'''
-                    .Where(p => Convert.ToString(p.{filter_property}).Contains("{cs_escape(filter_value)}"))'''
 
-    script = f"""using System;
-using System.IO;
-using System.Linq;
-using System.Reflection;
-using System.Collections.Generic;
-using Eplan.EplApi.MasterData;
-using Eplan.EplApi.Scripting;
-
-public class PartsQuery_{uuid.uuid4().hex[:6]}
-{{
-    // Resolve a requested property name against an MDPart.
-    //
-    // The previous version did part.Properties.GetType().GetProperty(name) and
-    // silently emitted "" when that returned null. It ALWAYS returned null for
-    // the tool's own defaults: "PartNr" and "Description1" are not members of
-    // MDPartsDatabaseItemPropertyList at all. PartNr/ProductGroup/
-    // ProductSubGroup/GenericProductGroup live on the MDPart itself, and the
-    // descriptive fields are ARTICLE_*-prefixed on the property list. Verified
-    // live on 2027.0.1: the old shape returned a list of EMPTY dicts with
-    // success:true.
-    //
-    // Also note GetProperty by bare name is unsafe on these types - MDPart
-    // declares "Properties" twice (MDPartsDatabaseItemPropertyList and
-    // PropertiesAndHandleObjectPropertyList) and ARTICLE_PARTNR has both a
-    // plain and an indexed form, so a naive lookup throws
-    // AmbiguousMatchException. Hence the friendly-name map plus a
-    // DeclaredOnly/Type.EmptyTypes walk for anything not in it.
-    static readonly Dictionary<string, string> FriendlyToArticle = BuildFriendlyMap();
-
-    static Dictionary<string, string> BuildFriendlyMap()
-    {{
-        // No index initializers in this literal on purpose - separate
-        // statements keep it readable next to the rest of the generated code.
-        var m = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
-        m["Description1"] = "ARTICLE_DESCR1";
-        m["Description2"] = "ARTICLE_DESCR2";
-        m["Description3"] = "ARTICLE_DESCR3";
-        m["Manufacturer"] = "ARTICLE_MANUFACTURER";
-        m["Supplier"] = "ARTICLE_SUPPLIER";
-        m["OrderNr"] = "ARTICLE_ORDERNR";
-        m["TypeNr"] = "ARTICLE_TYPENR";
-        return m;
-    }}
-
-    static PropertyInfo FindUnambiguous(Type t, string name)
-    {{
-        BindingFlags bf = BindingFlags.Public | BindingFlags.Instance | BindingFlags.DeclaredOnly;
-        Type cur = t;
-        while (cur != null)
-        {{
-            PropertyInfo pi = null;
-            try {{ pi = cur.GetProperty(name, bf, null, null, Type.EmptyTypes, null); }} catch {{ }}
-            if (pi != null && pi.CanRead) return pi;
-            cur = cur.BaseType;
-        }}
-        return null;
-    }}
-
-    static string ReadPartProperty(MDPart part, string propName)
-    {{
-        // 1. A direct member of MDPart (PartNr, ProductGroup, ...).
-        PropertyInfo direct = FindUnambiguous(typeof(MDPart), propName);
-        if (direct != null)
-        {{
-            object v = direct.GetValue(part, null);
-            return v == null ? "" : v.ToString();
-        }}
-
-        // 2. A property-list field, either by its ARTICLE_* name or via a
-        //    friendly alias the caller is more likely to type.
-        string articleName = propName;
-        if (FriendlyToArticle.ContainsKey(propName)) articleName = FriendlyToArticle[propName];
-
-        var pl = part.Properties;   // statically typed: no ambiguity here
-        PropertyInfo listProp = FindUnambiguous(pl.GetType(), articleName);
-        if (listProp != null)
-        {{
-            object v = listProp.GetValue(pl, null);
-            return v == null ? "" : v.ToString();
-        }}
-
-        throw new MissingMemberException(
-            "No property '" + propName + "' on MDPart or its property list " +
-            "(tried '" + articleName + "'). Descriptive fields are ARTICLE_*-" +
-            "prefixed; PartNr/ProductGroup/ProductSubGroup/GenericProductGroup " +
-            "are members of MDPart itself.");
-    }}
-
-    [Start]
-    public void Run()
-    {{
-        var results = new Dictionary<string, object>();
-        var partsList = new List<Dictionary<string, object>>();
-
-        try
-        {{
-            var mdParts = new MDPartsManagement();
-            using (var db = mdParts.OpenDatabase())
-            {{
-                var parts = db.Parts{filter_code}
-                    .Take({limit})
-                    .ToList();
-
-                string[] propsToGet = new string[] {{ {props_array} }};
-
-                foreach (var part in parts)
-                {{
-                    var partDict = new Dictionary<string, object>();
-                    foreach (var propName in propsToGet)
-                    {{
-                        try
-                        {{
-                            partDict[propName] = ReadPartProperty(part, propName);
-                        }}
-                        catch (Exception exProp)
-                        {{
-                            // Say WHY a property is missing instead of emitting
-                            // "". A silent empty string is how this tool used to
-                            // return a list of empty dicts and still report
-                            // success:true.
-                            partDict[propName] = "<error: " + exProp.GetType().Name + ">";
-                        }}
-                    }}
-                    partsList.Add(partDict);
-                }}
-
-                results["success"] = true;
-                results["count"] = partsList.Count;
-                results["parts"] = partsList;
-            }}
-        }}
-        catch (Exception ex)
-        {{
-            results["success"] = false;
-            results["error"] = ex.Message;
-        }}
-
-        string json = Newtonsoft.Json.JsonConvert.SerializeObject(results, Newtonsoft.Json.Formatting.Indented);
-        File.WriteAllText(@"{{{{RESULT_PATH}}}}", json);
-    }}
-}}
-"""
-    return _execute_script(script)
+    from . import parts_db_reflect
+    return _execute_script(parts_db_reflect.query_script(
+        filter_property, filter_value, return_properties, limit))
 
 
 def parts_db_count(filter_property: str = None, filter_value: str = None) -> dict:
@@ -722,54 +579,18 @@ def parts_db_count(filter_property: str = None, filter_value: str = None) -> dic
     Count parts in the EPLAN parts database.
 
     Args:
-        filter_property: Property to filter on
-        filter_value: Value to match
+        filter_property: Property to filter on (a member of MDPart, e.g. "PartNr")
+        filter_value: Value to match (substring, case-sensitive)
 
     Returns:
         dict with count
     """
-    filter_code = ""
     if filter_property and filter_value:
         if not _CS_IDENTIFIER.match(filter_property):
             return _identifier_error(filter_property, "filter_property")
-        filter_code = f'.Where(p => Convert.ToString(p.{filter_property}).Contains("{cs_escape(filter_value)}"))'
 
-    script = f"""using System;
-using System.IO;
-using System.Linq;
-using System.Collections.Generic;
-using Eplan.EplApi.MasterData;
-using Eplan.EplApi.Scripting;
-
-public class PartsCount_{uuid.uuid4().hex[:6]}
-{{
-    [Start]
-    public void Run()
-    {{
-        var results = new Dictionary<string, object>();
-
-        try
-        {{
-            var mdParts = new MDPartsManagement();
-            using (var db = mdParts.OpenDatabase())
-            {{
-                int count = db.Parts{filter_code}.Count();
-                results["success"] = true;
-                results["count"] = count;
-            }}
-        }}
-        catch (Exception ex)
-        {{
-            results["success"] = false;
-            results["error"] = ex.Message;
-        }}
-
-        string json = Newtonsoft.Json.JsonConvert.SerializeObject(results);
-        File.WriteAllText(@"{{{{RESULT_PATH}}}}", json);
-    }}
-}}
-"""
-    return _execute_script(script)
+    from . import parts_db_reflect
+    return _execute_script(parts_db_reflect.count_script(filter_property, filter_value))
 
 
 def parts_db_get_part(part_number: str) -> dict:
@@ -786,103 +607,12 @@ def parts_db_get_part(part_number: str) -> dict:
         ProductSubGroup and GenericProductGroup.
 
         Note GenericProductGroup: that is the real name of the MDPart member
-        holding a ProductTopGroup value. This function previously read
-        `part.ProductTopGroup`, which does not exist, so the generated script
-        failed to compile (CS1061) and the tool could only ever return
-        "Timeout waiting for script results" - a compile error surfaces here as
-        a timeout, never as a compiler message.
+        holding a ProductTopGroup value (MDPart has no `ProductTopGroup`
+        member). The MasterData types are resolved by reflection (v3), so the
+        script also compiles on EPLAN 2.9.
     """
-    part_number_cs = cs_escape(part_number)
-    script = f'''using System;
-using System.IO;
-using System.Linq;
-using System.Collections.Generic;
-using Eplan.EplApi.MasterData;
-using Eplan.EplApi.Scripting;
-
-public class PartsGet_{uuid.uuid4().hex[:6]}
-{{
-    // Flatten any EPLAN property value to a plain string.
-    //
-    // Load-bearing: what goes into the results dictionary is serialised by
-    // Newtonsoft at the end of the script. A live EPLAN object placed in there
-    // sends the serialiser walking a native object graph and the script never
-    // returns - which reaches the caller as a bare timeout-waiting-for-results
-    // message, with nothing in EPLAN's own message log to explain it. So:
-    // convert FIRST, serialise second.
-    static string Str(object value)
-    {{
-        if (value == null) return "";
-        try {{ return value.ToString() ?? ""; }}
-        catch {{ return ""; }}
-    }}
-
-    [Start]
-    public void Run()
-    {{
-        var results = new Dictionary<string, object>();
-
-        try
-        {{
-            var mdParts = new MDPartsManagement();
-            using (var db = mdParts.OpenDatabase())
-            {{
-                var part = db.Parts.FirstOrDefault(p => p.PartNr == "{part_number_cs}");
-
-                if (part != null)
-                {{
-                    var props = part.Properties;
-                    var partDict = new Dictionary<string, object>();
-                    // Every value is flattened to a STRING before it goes in.
-                    //
-                    // props.ARTICLE_* returns an MDPropertyValue - a live EPLAN
-                    // object, not a string. `?? ""` kept it as an object, and
-                    // JsonConvert.SerializeObject then tried to walk that native
-                    // object graph at the end of the script. The script never
-                    // finished, so no result file was written and the caller saw
-                    // "Timeout waiting for script results" with no compiler error
-                    // anywhere to explain it. Measured on 2027.0.1: the parts DB
-                    // here holds 150 parts and the lookup itself takes 1ms, so
-                    // the timeout was never about size.
-                    partDict["PartNr"] = Str(props.ARTICLE_PARTNR);
-                    partDict["Description1"] = Str(props.ARTICLE_DESCR1);
-                    partDict["Description2"] = Str(props.ARTICLE_DESCR2);
-                    partDict["Description3"] = Str(props.ARTICLE_DESCR3);
-                    partDict["Manufacturer"] = Str(props.ARTICLE_MANUFACTURER);
-                    partDict["Supplier"] = Str(props.ARTICLE_SUPPLIER);
-                    partDict["OrderNr"] = Str(props.ARTICLE_ORDERNR);
-                    partDict["ProductGroup"] = part.ProductGroup.ToString();
-                    partDict["ProductSubGroup"] = part.ProductSubGroup.ToString();
-                    // MDPart has NO "ProductTopGroup" member. The property that
-                    // holds a ProductTopGroup value is called
-                    // GenericProductGroup - confirmed by reflecting over MDPart
-                    // on 2027.0.1. The old name made the script fail to compile
-                    // with CS1061, which surfaced as the same silent timeout.
-                    partDict["GenericProductGroup"] = part.GenericProductGroup.ToString();
-
-                    results["success"] = true;
-                    results["found"] = true;
-                    results["part"] = partDict;
-                }}
-                else
-                {{
-                    results["success"] = true;
-                    results["found"] = false;
-                }}
-            }}
-        }}
-        catch (Exception ex)
-        {{
-            results["success"] = false;
-            results["error"] = ex.Message;
-        }}
-
-        string json = Newtonsoft.Json.JsonConvert.SerializeObject(results, Newtonsoft.Json.Formatting.Indented);
-        File.WriteAllText(@"{{{{RESULT_PATH}}}}", json);
-    }}
-}}
-'''
-    return _execute_script(script)
+    from . import parts_db_reflect
+    return _execute_script(parts_db_reflect.get_part_script(part_number))
 
 
 def parts_db_create(part_number: str, properties: dict = None) -> dict:
@@ -1070,47 +800,14 @@ def parts_db_list_product_groups() -> dict:
     """
     List all product groups and subgroups in the parts database.
 
+    The enums are resolved by reflection (v3) - no `using
+    Eplan.EplApi.MasterData`, which does not compile on EPLAN 2.9.
+
     Returns:
         dict with product groups
     """
-    script = f"""using System;
-using System.IO;
-using System.Linq;
-using System.Collections.Generic;
-using Eplan.EplApi.MasterData;
-using Eplan.EplApi.Scripting;
-
-public class PartsGroups_{uuid.uuid4().hex[:6]}
-{{
-    [Start]
-    public void Run()
-    {{
-        var results = new Dictionary<string, object>();
-
-        try
-        {{
-            var groups = Enum.GetNames(typeof(MDPartsDatabaseItem.Enums.ProductGroup)).ToList();
-            var subGroups = Enum.GetNames(typeof(MDPartsDatabaseItem.Enums.ProductSubGroup)).ToList();
-            var topGroups = Enum.GetNames(typeof(MDPartsDatabaseItem.Enums.ProductTopGroup)).ToList();
-
-            results["success"] = true;
-            results["productGroups"] = groups;
-            results["productSubGroups"] = subGroups;
-            results["productTopGroups"] = topGroups;
-        }}
-        catch (Exception ex)
-        {{
-            results["success"] = false;
-            results["error"] = ex.Message;
-        }}
-
-        string json = Newtonsoft.Json.JsonConvert.SerializeObject(results, Newtonsoft.Json.Formatting.Indented);
-        File.WriteAllText(@"{{{{RESULT_PATH}}}}", json);
-    }}
-}}
-"""
-    return _execute_script(script)
-
+    from . import parts_db_reflect
+    return _execute_script(parts_db_reflect.product_groups_script())
 
 # =============================================================================
 # SETTINGS API (Direct typed access)

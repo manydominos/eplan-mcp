@@ -47,12 +47,12 @@ def test_parts_db_query_rejects_non_integer_limit(capture):
 def test_parts_db_query_coerces_numeric_string_limit(capture):
     result = scripted.parts_db_query(limit="25")
     assert result["success"] is True
-    assert ".Take(25)" in capture["script"]
+    assert "int limit = 25;" in capture["script"]  # v3: reflection, no LINQ .Take
 
 
 def test_parts_db_query_default_limit_in_script(capture):
     scripted.parts_db_query()
-    assert ".Take(100)" in capture["script"]
+    assert "int limit = 100;" in capture["script"]  # v3
 
 
 # ---------------------------------------------------------------------------
@@ -358,7 +358,7 @@ def test_get_part_uses_generic_product_group(capture):
     error, another silent timeout."""
     scripted.parts_db_get_part("PN-1")
     script = capture["script"]
-    assert "part.GenericProductGroup" in script
+    assert '"GenericProductGroup"' in script  # v3: read by reflection
     assert "part.ProductTopGroup" not in script
 
 
